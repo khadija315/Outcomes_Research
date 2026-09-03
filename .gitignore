@@ -3,8 +3,8 @@
 .RData
 .Ruserdata
 .positai
-.pdf
-.Rproj
+
+
 
 # R / RStudio / Posit
 .Rproj.user/
@@ -20,6 +20,8 @@ code_draft/
 # Temporary files
 *.tmp
 *.temp
+*.Rproj
+*.pdf
 
 # OS files
 .DS_Store
