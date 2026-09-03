@@ -433,6 +433,11 @@ table3 %>%
 
 
 ## Treatment distribution change over time using a chi-square test
+Out$Treatment <- factor(
+  Out$TRT2,
+  levels = c(0,1),
+  labels = c("Cohen", "Lich–Gregoir")
+)
 
 tab_year <- table(Out$YEARS, Out$Treatment)
 
@@ -4177,7 +4182,7 @@ st_results_psm2 %>%
 
 #### Block 2i1 - without VUR recurrence
 
-```{r reg2m_norec}
+```{r reg2i1m_norec}
 
 # Block 2: exposure-effect analysis (stent) on postoperative outcomes = Multivariable analyses
 
@@ -4452,7 +4457,7 @@ st_results_psm2 %>%
 
 #### Block 2i2 - without VUR recurrence + with interaction (to calculate OR for two levels) (secondary effect-modification analysis)
 
-```{r reg2m_norec}
+```{r reg2i2m_norec}
 
 # Block 2: exposure-effect analysis (stent) on postoperative outcomes = Multivariable analyses
 
@@ -4895,7 +4900,7 @@ save_as_docx(
 
 #### 5.1 Filter & match the new population
 
-```{r filterpain}
+```{r filterpain_m}
 
 # Filter dataset to only those who did not receive EPIDURAL
 Outp <- Out %>%
@@ -5109,7 +5114,7 @@ ggsave(
  
 #### 5.2 Descriptive analysis
 
-```{r painw}
+```{r painm}
 
 # mdatap is the dataset with added weightsp_psm
 
@@ -5284,14 +5289,17 @@ before <- Outp %>%
   mutate(
     plot_weight = 1,
     Status = "Before matching (N=383), p<0.001"
-  )
+  ) %>%
+  dplyr::select(PAIN, TRT2, Treatment, plot_weight, Status)
 
 # After matching: matched non-epidural population
 after <- mdatap %>%
   mutate(
     plot_weight = weightsp_psm,
     Status = "After matching (N=180), p<0.001"
-  )
+  ) %>%
+  dplyr::select(PAIN, TRT2, Treatment, plot_weight, Status)
+
 
 # -----------------------------
 # 2. Combine datasets
@@ -5411,7 +5419,7 @@ ggsave(
 
 #### 5.4 Regression
 
-```{r regpain}
+```{r regpainm}
 
 # -----------------------------------------
 ### Moderate-severe pain vs. Other levels
@@ -5774,7 +5782,7 @@ interaction_results
 
 #### 5.5 Rosenbaum's sensitivity analyses 
 
-```{r rosenbaum}
+```{r rosenbaum_p}
 
 # Rosenbaum's primal sensitivity analysis
 

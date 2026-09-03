@@ -15,6 +15,7 @@
 
 # Research data - DO NOT upload
 data/
+code_draft/
 
 # Temporary files
 *.tmp
