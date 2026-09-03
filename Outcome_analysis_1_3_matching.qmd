@@ -1,0 +1,1684 @@
+---
+title: "Outcome_analysis"
+author: "Khadija Ismail"
+date: "`r Sys.Date()`"
+format:
+  pdf:
+    documentclass: article
+    geometry: margin=1in
+    code-overflow: wrap
+    latex-engine: xelatex  # allows better font and color handling
+    highlight-style: kate    # built-in code coloring
+header-includes:
+  - \usepackage{tcolorbox}
+  - |
+    \tcbset{
+      colback=blue!10,
+      colframe=blue!50,
+      boxrule=0.5pt,
+      arc=2mm,
+      left=2mm,
+      right=2mm,
+      top=1mm,
+      bottom=1mm
+    }  
+---
+
+## Create the folders
+
+```{r create folders, eval=FALSE}
+
+dir.create("output")
+dir.create("figures")
+dir.create("reports")
+
+```
+
+## Load necessary libraries
+
+```{r libraries, include = FALSE, warning=FALSE}
+
+library(here)            # To manage project file paths reproducibly
+library(dplyr)           # For data manipulation and wrangling
+library(VIM)             # For KNN imputation and visualization of missing data
+library(gtsummary)       # To create publication-ready summary and regression tables
+library(flextable)       # To export  gtsummary tables in a Word Doc, ideal for gtsummary
+library(ggplot2)         # For data visualization and plotting
+library(survival)        # For survival analysis (Kaplan–Meier and Cox proportional hazards models)
+library(survminer)       # For enhanced visualization of survival curves and reporting of log-rank tests
+library(patchwork)       # To save Kaplan–Meier plots with risk tables, and eliminates alignment drift
+library(MatchIt)         # For propensity score matching
+library(readr)           # To read and write rectangular data files (e.g., CSV)
+library(cobalt)          # To assess covariate balance and create Love plots
+library(sensitivitymv)   # For Rosenbaum sensitivity analysis in matched studies with 1:k matching
+library(purrr)           # To apply functions repeatedly over vectors, lists, or data frames without writing explicit loops.
+
+library(sensitivitymult) # For Rosenbaum sensitivity analysis with Multiple  Outcomes
+library(rbounds)     # For Rosenbaum sensitivity analysis in matched studies with 1:1 matching
+library(EValue)      # For E-value sensitivity analysis: impact of unmeasured confounders on the observed treatment-outcome relationship.
+library(geepack)     # For generalized estimating equations (GEE) models
+library(pROC)        # For ROC curve analysis and AUC calculation
+library(tidyr)       # For reshaping and tidying data
+library(labelled)    # To manage variable labels and metadata
+
+
+# library(tableone)    # To create descriptive “Table 1” baseline tables
+# library(knitr)       # To create formatted tables in R Markdown/Quarto reports
+# options(timeout = 600)
+# set.seed(123) # Fixes the sequence of "random" operations = the same individuals are matched every time
+# library(gridExtra)   # To save Kaplan–Meier plots with risk tables when `arrange_ggsurvplots()` fails, showed alignement issue between plot and risk table
+
+```
+
+## 1 Import data and define variables
+
+```{r import, include = TRUE}
+
+Outcome <- read.csv(
+  here("data", "Outcome_data.csv"),
+  header = TRUE,
+  check.names = FALSE
+)
+
+Outcome <- Outcome %>%
+  mutate(
+    across(c(PID, QCODE), as.character),
+    
+    across(c(AGS, YEARS,BLDLOSS, BMI, CATHPERIOD, FUPM, HOSPTIME,OPRTIME,
+             POSTUTIFUP, POSTUTI_T), as.numeric),
+    
+    across(c(REC011, ANASTOMO,BLDCOMPLEAK,BLDCOMPRETN,BLDCOMPVOID,BLDSPASM,CATH,CENTER,
+             CLAVIENCLASS,EPIDURAL,GENDER, GU30, GU90N, GUER30, GUER90, HEMAT, 
+             HISTOINJ,ILEUS, INCCOMPBLEED, INCCOMPINF, INCCOMPSCAR, NARC, 
+             NONARC, PAIN, PREOPEPISODE1, PREOPRNPLN, PREOPRNSCR, PREOPTYPEU1,
+             PREOPVURGRADE, PROC365, STENT, SURGIND, SURGTECH2, TRT2, UDR7M,
+             URCOMPCVUR, URCOMPINJ, URCOMPOBST, URCOMPSTEN, POSTUTI, VURPHASE,
+             VURSIDE, RECGRADE_MAX), as.factor)
+  )
+
+str(Outcome) # 412 obs. of 55 variables
+
+```
+
+## 2 Data Imputation using KNN (k-nearest neighbors)
+
+```{r imputation, include = TRUE}
+
+# Missingness in the dataset
+m_outcome <- colSums(is.na(Outcome)) / nrow(Outcome) * 100
+print(m_outcome)
+
+
+# KNN imputation
+Outcome_knn <- Outcome # create a temporary dataset copy for KNN using scaled variables
+
+# Convert categorical variables
+cat_vars <- c(
+  "GENDER","PREOPVURGRADE", "VURPHASE","VURSIDE",
+  "UDR7M","PREOPRNSCR","HISTOINJ","SURGIND",
+  "CENTER","TRT2", "SURGTECH2",
+  "PREOPEPISODE1", "PREOPRNPLN","PREOPTYPEU1"
+)
+Outcome_knn[cat_vars] <- lapply(Outcome_knn[cat_vars], as.factor)
+
+# Scale continuous variables
+continuous_vars <- c("AGS", "BMI", "YEARS")
+Outcome_knn[continuous_vars] <- scale(Outcome_knn[continuous_vars])
+
+
+# KNN imputation without subsetting the dataset
+Outcome_knn <- kNN(
+  Outcome_knn,
+  variable = c("PREOPEPISODE1", "PREOPRNPLN", "PREOPTYPEU1"),  # Variables to impute
+  dist_var = c("AGS","GENDER","BMI", # Variables used to compute patient similarity
+    "PREOPVURGRADE","VURPHASE","VURSIDE","UDR7M",
+    "PREOPRNSCR","HISTOINJ","SURGIND","YEARS",
+    "TRT2"
+  ),
+  k = 5,
+  imp_var = FALSE
+)
+
+
+# CENTER + TRT2 + SURGTECH2 together may overweight institutional structure, which means clustering patients by institution rather than biology → keep only one of them, I will keep "TRT2".
+
+Out <- Outcome   # New dataset for analysis including imputed variables 
+
+Out$PREOPEPISODE1 <- Outcome_knn$PREOPEPISODE1
+Out$PREOPRNPLN   <- Outcome_knn$PREOPRNPLN
+Out$PREOPTYPEU1  <- Outcome_knn$PREOPTYPEU1
+```
+
+## 3 Recode and create (composite) variables
+
+```{r recode}
+
+# Recode SURGIND into SURGIND2
+
+Out <- Out %>%
+  mutate(
+    SURGIND2 = case_when(
+      SURGIND == 4 ~ 1,
+      SURGIND == 3 ~ 2,
+      SURGIND == 1 ~ 3,
+      SURGIND == 2 ~ 4,
+      SURGIND %in% c(5, 6, 7, 8, 9, 10, 11) ~ 5,
+      TRUE ~ NA_real_
+    ),
+    SURGIND2 = factor(SURGIND2)
+  )
+
+
+# Create a new variable LUTD by combining BLDCOMPRETN, BLDCOMPVOID, BLDCOMPLEAK
+Out <- Out %>%
+  mutate(
+    LUTD = case_when(
+      BLDCOMPRETN == 1 |
+      BLDCOMPVOID == 1 |
+      BLDCOMPLEAK == 1 ~ 1,
+
+      BLDCOMPRETN == 0 &
+      BLDCOMPVOID == 0 &
+      BLDCOMPLEAK == 0 ~ 0,
+
+      TRUE ~ NA_real_
+    ),
+    LUTD = factor(LUTD)
+  )
+
+
+# Create a new variable OBST by combining URCOMPOBST, URCOMPSTEN, ANASTOMO
+Out <- Out %>%
+  mutate(
+    OBST = case_when(
+      URCOMPOBST == 1 |
+      URCOMPSTEN == 1 |
+      ANASTOMO == 1 ~ 1,
+
+      URCOMPOBST == 0 &
+      URCOMPSTEN == 0 &
+      ANASTOMO == 0 ~ 0,
+
+      TRUE ~ NA_real_
+    ),
+    OBST = factor(OBST)
+  )
+
+
+# Create a new variable SURG by combining INCCOMPBLEED, INCCOMPINF, INCCOMPSCAR
+Out <- Out %>%
+  mutate(
+    SURG = case_when(
+      INCCOMPBLEED == 1 |
+      INCCOMPINF == 1 |
+      INCCOMPSCAR == 1 ~ 1,
+
+      INCCOMPBLEED == 0 &
+      INCCOMPINF == 0 &
+      INCCOMPSCAR == 0 ~ 0,
+
+      TRUE ~ NA_real_
+    ),
+    SURG = factor(SURG)
+  )
+
+# Create a new variable GU90 by combining no readmission (0) and unplanned readmission (2)
+Out <- Out %>%
+  mutate(
+    GU90 = recode(as.character(GU90N),
+                  "0" = "0",
+                  "1" = "1",
+                  "2" = "0"),
+    GU90 = factor(GU90)
+  )
+
+# Convert variables to appropriate data types for analysis
+Out <- Out %>%
+  mutate(
+    across(c(PID, QCODE), as.character),
+    
+    across(c(AGS, YEARS,BLDLOSS, BMI, CATHPERIOD, FUPM, HOSPTIME,OPRTIME,
+             POSTUTIFUP, POSTUTI_T), as.numeric),
+    
+    across(c(REC011, ANASTOMO,BLDCOMPLEAK,BLDCOMPRETN,BLDCOMPVOID,BLDSPASM,CATH,CENTER,
+             CLAVIENCLASS,EPIDURAL,GENDER, GU30, GU90N, GUER30, GUER90, HEMAT, 
+             HISTOINJ,ILEUS, INCCOMPBLEED, INCCOMPINF, INCCOMPSCAR, NARC, 
+             NONARC, PAIN, PREOPEPISODE1, PREOPRNPLN, PREOPRNSCR, PREOPTYPEU1,
+             PREOPVURGRADE, PROC365, STENT, SURGIND, SURGTECH2, TRT2, UDR7M,
+             URCOMPCVUR, URCOMPINJ, URCOMPOBST, URCOMPSTEN, POSTUTI, VURPHASE,
+             VURSIDE, RECGRADE_MAX, SURGIND2, LUTD, OBST, SURG, GU90), as.factor)
+  )
+
+str(Out) # 412 obs. of 60 variables
+
+```
+
+
+## 4 Descriptive analysis: BEFORE matching
+
+```{r descriptive, warning=FALSE}
+
+# Baseline characteristics
+table1<- Out %>%
+  select(AGS, GENDER, BMI, HISTOINJ, SURGIND2, PREOPVURGRADE, VURSIDE, UDR7M, 
+         VURPHASE, PREOPTYPEU1, PREOPEPISODE1, PREOPRNPLN, PREOPRNSCR,
+         SURGTECH2, CENTER, TRT2
+  ) %>%
+  tbl_summary(
+    by = TRT2,  # for stratification
+    statistic = list(
+      all_continuous() ~ "{median} ({p25}-{p75})",
+      all_categorical() ~ "{n} ({p}%)" 
+    ),
+    digits = all_categorical() ~ c(0, 1),  # n = 0 decimals, p = 1 decimal
+    missing = "ifany",  # shows missing only when present
+    missing_text = "Missing"
+  ) %>%
+  add_overall() %>%
+  add_p(pvalue_fun = ~style_pvalue(.x, digits = 3)) %>%  #  3 decimals 
+  bold_labels()
+
+table1
+
+table1 %>%
+  as_flex_table() %>%
+  flextable::save_as_docx(path = "output/baseline_before_matching.docx")
+
+
+
+# Procedural factors
+table2<- Out %>%
+  select(TRT2, OPRTIME, STENT, CATH, CATHPERIOD, HOSPTIME) %>%
+  tbl_summary(
+    by = TRT2,  # for stratification
+    statistic = list(
+      all_continuous() ~ "{median} ({p25}-{p75})", # or ~ "{mean} ± {sd}",
+      all_categorical() ~ "{n} ({p}%)" 
+    ),
+    digits = all_categorical() ~ c(0, 1),  # n = 0 decimals, p = 1 decimal
+    missing = "ifany",
+    missing_text = "Missing"
+  ) %>%
+  add_overall() %>%
+  add_p(pvalue_fun = ~style_pvalue(.x, digits = 3)) %>%  #  3 decimals 
+  bold_labels()
+
+table2
+
+table2 %>%
+  as_flex_table() %>%
+  flextable::save_as_docx(path = "output/procedural_factors_before_matching.docx")
+
+
+# Plot catheterization distribution
+p <- ggplot(
+  Out,
+  aes(
+    x = factor(
+      TRT2,
+      levels = c(0, 1),
+      labels = c("Cohen Group", "Lich-Gregoir Group")
+    ),
+    y = CATHPERIOD
+  )
+) +
+  geom_boxplot() +
+  labs(
+    x = "Treatment Group",
+    y = "Catheterization Duration (days) Before Matching"
+  ) +
+  theme_bw()   #optional
+
+ggsave(filename = "figures/catheterization_duration_before_matching.png", 
+       plot = p, 
+       width = 8,   # width in inches
+       height = 6,  # height in inches
+       dpi = 300)   # resolution
+
+
+
+# Outcomes
+table3<- Out %>%
+  select(TRT2, FUPM, LUTD, OBST, URCOMPINJ, SURG, ILEUS, CLAVIENCLASS, URCOMPCVUR,
+         GU30, GU90, GU90N, GUER30, GUER90, PROC365, 
+         REC011, RECGRADE_MAX, 
+         BLDLOSS, BLDSPASM, HEMAT, 
+         POSTUTI) %>%
+  tbl_summary(
+    by = TRT2,  # for stratification
+    statistic = list(
+      all_continuous() ~ "{median} ({p25}-{p75})", # or ~ "{mean} ± {sd}",
+      all_categorical() ~ "{n} ({p}%)" 
+    ),
+    digits = all_categorical() ~ c(0, 1),  # n = 0 decimals, p = 1 decimal
+    missing = "ifany",
+    missing_text = "Missing"
+  ) %>%
+  add_overall() %>%
+  add_p(pvalue_fun = ~style_pvalue(.x, digits = 3)) %>%  #  3 decimals 
+  bold_labels()
+
+table3
+
+table3 %>%
+  as_flex_table() %>%
+  flextable::save_as_docx(path = "output/outcomes_before_matching.docx")
+
+
+# Proportion plot for treatment across years (temporal changes in practice)
+p_y <- ggplot(
+  Out,
+  aes(
+    x = factor(YEARS),
+    fill = factor(TRT2,
+                  levels = c(0,1),
+                  labels = c("Cohen Group", "Lich-Gregoir Group"))
+  )
+) +
+  geom_bar(position = "fill") +
+  scale_y_continuous(labels = scales::percent) +
+  scale_fill_manual(values = c(
+    "Cohen Group" = "#ADD8E6",
+    "Lich-Gregoir Group" = "#00008B"
+  )) +
+  labs(x = "Year of Surgery", y = "Proportion", fill = "Group") +
+  theme_bw()
+
+p_y
+
+ggsave(filename = "figures/treatment_across_years_before_matching.png", 
+       plot = p_y, 
+       width = 8,   # width in inches
+       height = 6,  # height in inches
+       dpi = 300)   # resolution
+
+
+######## Postoperative UTI outcome as time-to-event outcome
+
+# Create labeled TRT2 variable only for survival analysis
+Out$Treatment <- factor(
+  Out$TRT2,
+  levels = c(0,1),
+  labels = c("Cohen", "Lich–Gregoir")
+)
+
+surv_object <- Surv(time = Out$POSTUTIFUP, event = Out$POSTUTI== 1)
+fit <- survfit(surv_object ~ Treatment , data = Out)
+
+p_u <- ggsurvplot(
+  fit,
+  data = Out,
+  fun="event",  # Show cumulative incidence (1 - survival)
+  pval = TRUE,
+  pval.size = 4,
+  conf.int = TRUE,
+  risk.table = TRUE,
+
+  xlim = c(0, 135),
+  break.time.by = 12,
+
+  xlab = "Follow-up time",
+  ylab = "Cumulative incidence of 
+      postopetative symptomatic UTI before matching",
+
+  risk.table.y.text = FALSE,   # to remove text from y-axis in the risk table
+  # risk.table.title = "At risk",
+  risk.table.fontsize = 4,   # ontrols numbers in table
+
+  palette = c("#ADD8E6", "#00008B"),
+  ylim = c(0, 1),  # Force y-axis from 0 to 1
+
+  pval.coord = c(0, 0.9)  #  c(x,y) according to my x and y scale
+
+)
+
+# To modify the plot
+p_u$plot <- p_u$plot + scale_x_continuous(limits = c(0, 135), breaks = seq(0, 135, 12))
+p_u$plot <- p_u$plot +
+  scale_y_continuous(
+    labels = function(x) paste0(round(x * 100, 1), "%"),
+    limits = c(0, 1)
+  )
+p_u$plot <- p_u$plot +
+  theme(
+    axis.title.x = element_text(size = 12),
+    axis.title.y = element_text(size = 12),
+    axis.text.x = element_text(size = 10),
+    axis.text.y = element_text(size = 10)
+  )
+
+# To modify the risk table
+p_u$table <- p_u$table + scale_x_continuous(limits = c(0, 135), breaks = seq(0, 135, 12))
+p_u$table <- p_u$table +                 
+  theme(
+    axis.title.x = element_blank(),
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    axis.line.x = element_blank(),
+    axis.line.y = element_blank()
+  )
+p_u$table <- p_u$table +
+  theme(
+    plot.title = element_text(size = 12),
+    text = element_text(size = 10),
+    axis.title.y = element_text(size = 12),
+  )
+# To save plot and risk table using patchwork
+# ggsave() only works with a single ggplot object.
+final_plot <- p_u$plot / p_u$table + plot_layout(heights = c(4, 1))
+ggsave(filename = "figures/UTI_outcome_before_matching.png", final_plot, width = 8, height = 6, dpi = 300)
+
+```
+
+
+## 5 Pain descriptive analysis: BEFORE matching
+
+```{r pain}
+
+# Filter dataset to only those who did not receive EPIDURAL
+Outp <- Out %>%
+  filter(EPIDURAL == "0") %>%
+  mutate(
+    PAIN = factor(
+      PAIN,
+      levels = c("0", "1", "2", "3"),
+      labels = c(
+        "No pain",
+        "Mild pain (score 1-3)",
+        "Moderate pain (score 4-6)",
+        "Severe pain (score 7-10)"
+      )
+    )
+  )
+
+table4 <- Outp %>%
+  select(PAIN, NARC, NONARC, Treatment) %>%
+  tbl_summary(
+    by = Treatment,
+    statistic = list(
+      all_categorical() ~ "{n} ({p}%)"
+    ),
+    label = list(
+      PAIN ~ "Pain score",
+      NARC ~ "Narcotic use",
+      NONARC ~ "Non-narcotic use"
+    ),
+    digits = all_categorical() ~ c(0, 1),
+    missing = "ifany",
+    missing_text = "Missing"
+  ) %>%
+  add_overall() %>%
+  add_p(pvalue_fun = ~style_pvalue(.x, digits = 3)) %>%
+  bold_labels()
+
+table4
+
+table4 %>%
+  as_flex_table() %>%
+  flextable::save_as_docx(path = "output/pain_before_matching.docx")
+```
+
+## 6 Do matching
+
+```{r matching, warning=FALSE}
+
+# Fit matching model using propensity score (calculated inside MatchIt)
+
+set.seed(123) # Fixes the sequence of "random" operations = the same individuals are matched every time
+ 
+m.out <- matchit(
+  TRT2 ~ AGS + YEARS + GENDER + BMI + PREOPRNPLN + HISTOINJ +
+    SURGIND2 + PREOPVURGRADE + VURSIDE + UDR7M + VURPHASE +
+    PREOPEPISODE1 + PREOPTYPEU1 + PREOPRNSCR + SURGTECH2,
+  data = Out,
+  method = "nearest",
+  ratio = 3,  # 1:3 matching (1 treated : 3 control), it is up to 3 controls, not necessarily 3 controls for each treated
+  distance = "logit",
+# caliper should be a numeric value in MatchIt
+# This means: 0.2 SD of the logit of PS (MatchIt interprets correctly)
+   caliper = 0.2   # A caliper = maximum allowed distance between treated and control, Caliper = 0.2 SD of the logit of the propensity score (Austin, 2011 recommendation)
+)
+
+
+# When the variance of the linear propensity score in the treatment group is twice as large as that in the control group, a caliper of 0.2 standard deviations removes 98% of the bias in a normally distributed covariate. If the variance in the treatment group is much larger than that in the control group, smaller calipers are necessary.
+
+mdata <- match.data(m.out)    # Extract the matched dataset with columns: distance(PS), weights, subclass
+# weights = how much each matched subject contributes in analysis
+# In 1:1 matching, weights usually = 1
+# you can ignore weights in further analysis, but using them is safer and more standard
+# glm(outcome ~ TRT2, data = mdata, weights = weights) (standard) or glm(outcome ~ TRT2, data = mdata)
+
+readr::write_csv(mdata, "data/matched_data.csv")  
+# write.csv() = base R, simple, works everywhere: write.csv(mdata, file = "data/matched_data.csv", row.names = FALSE)
+# write_csv() = modern, faster, cleaner, recommended for research workflows 
+
+
+# Table for balance
+# This gives: SMD before and after matching, and flagged imbalance (>0.1)
+bal <- cobalt::bal.tab(m.out, un = TRUE, m.threshold = 0.1)  
+# un=TRUE shows imbalance before AND after matching, un=FALSE shows only after matching
+bal 
+
+bal_df <- as.data.frame(bal$Balance)
+smd_table <- bal_df %>%
+  mutate(
+    Variable = rownames(bal_df),
+    SMD_Before = round(abs(Diff.Un), 3),
+    SMD_After  = round(abs(Diff.Adj), 3)
+  ) %>%
+  select(Variable, SMD_Before, SMD_After) # SMDs for each covariate individually, before and after matching
+
+smd_table %>%
+  flextable() %>%
+  save_as_docx(path = "output/SMD_table.docx")
+
+
+# Figure for balance - Love plot
+# Review guidelines to decide on plotting Standardized or Absolute Mean Differences
+pl <- love.plot(
+  m.out,
+  threshold = 0.1,
+  abs = FALSE, # As SMD sign is meaningless for balance, show only absolute SMDs using abs = TRUE (the correct interpretation of SMD): Because SMD direction (+/-) is meaningless, only magnitude matters
+  stats = "mean.diffs",       # forces SMD instead of raw differences
+  var.order = "unadjusted",   # Orders variables based on imbalance before matching
+  drop.distance = TRUE,      # To exclude the distance from the plot
+  sample.names = c("Before Matching", "After Matching"),
+    var.names = c(
+    AGS = "Age at surgery",
+    YEARS = "Year of surgery",
+    BMI = "Body mass index",
+    GENDER = "Female gender",
+    PREOPRNPLN = "Preop pyelonephritis",
+    HISTOINJ = "History of injection",
+    VURSIDE = "Right-sided VUR",
+    UDR7M = "Ureteral dilation ≥ 7mm",
+    PREOPTYPEU1 = "Preop febrile UTIs",
+    PREOPRNSCR = "Preop renal scarring",
+    VURPHASE_1 = "Reflux: voiding phase",
+    VURPHASE_2 = "Reflux: filling phase",
+    VURPHASE_3 = "Reflux: filling + voiding",
+    SURGTECH2_1 = "Surgeon experience ≥100 operations",
+    SURGTECH2_2 = "Surgeon experience 50-100 operations",
+    SURGTECH2_3 = "Surgeon experience <50 operations",
+    PREOPEPISODE1_1 = "Preop UTI episodes: 1",
+    PREOPEPISODE1_2 = "Preop UTI episodes: 2",
+    PREOPEPISODE1_3 = "Preop UTI episodes: ≥3",
+    SURGIND2_1 = "Indication: breakthrough UTI",
+    SURGIND2_2 = "Indication: high-grade reflux (III-V)",
+    SURGIND2_3 = "Indication: poor compliance to medical treatment",
+    SURGIND2_4 = "Indication: ineffective/poorly tolerated CAP",
+    SURGIND2_5 = "Indication: other",
+    PREOPVURGRADE_3 = "Preop VUR grade: III",
+    PREOPVURGRADE_4 = "Preop VUR grade: IV",
+    PREOPVURGRADE_5 = "Preop VUR grade: V"
+  )
+  )
+
+pl <- pl +
+    labs(x = "Standardized Mean Differences") +
+    theme(
+      plot.margin = margin(10, 10, 10, 10),
+      axis.text = element_text(size = 16),
+      axis.title = element_text(size = 16),
+      plot.title = element_text(size = 16),
+      legend.text = element_text(size = 16),
+      legend.title = element_text(size = 16),
+      axis.ticks = element_line(size = 0.5, color = "black"),
+      axis.line = element_line(size = 0.5, color = "black"),
+      panel.background = element_blank(), 
+      panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank(),
+      panel.border = element_blank(),
+      axis.ticks.length = unit(0.3, "cm"),
+      panel.spacing = unit(2, "lines")
+   )
+
+ggsave ("figures/love_plot.png", plot = pl, width = 12, height = 10, dpi = 300)
+
+
+# To save the plot with white background, if requested for publication
+# ggsave(
+#   "figures/love_plot.png",
+#   plot = pl,
+#   width = 12,
+#   height = 10,
+#   dpi = 300,
+#   bg = "white"
+# )
+
+
+# Note: A propensity score should include: only baseline variables measured before treatment assignment
+
+# “Distance” in the Love plot is the propensity score itself, included to show how well matching balanced the overall treatment assignment mechanism.
+# Reviewers mainly check:
+## All covariates < 0.1 after matching
+## Distance reduced substantially
+## Visual improvement in Love plot
+# many papers exclude distance because: It is not a confounder, it is a derived variable, it often has very large pre-match imbalance (can visually dominate plot), it adds little clinical interpretation
+
+
+# Compute mean SMD
+smd_df <- bal$Balance
+mean_smd_before <- mean(abs(smd_df$Diff.Un), na.rm = TRUE) # calculate mean SMD before matching
+mean_smd_after <- mean(abs(smd_df$Diff.Adj), na.rm = TRUE) # calculate mean SMD before matching
+mean_smd <- data.frame(
+  Mean_SMD_Before = mean_smd_before,
+  Mean_SMD_After = mean_smd_after
+)
+
+mean_smd
+
+# Best reporting practices
+# “All covariates had SMD < 0.1 (threshold) after matching": Covariate balance was assessed using standardized mean differences (SMD), with values < 0.1 indicating adequate balance.
+# (optionally) “Mean absolute SMD decreased from X to Y”: It is acceptable as a summary metric but not a replacement for individual SMDs
+
+```
+
+
+## 7 Descriptive analysis: AFTER matching
+
+```{r descriptive, warning=FALSE}
+
+# The following descriptive tables are correct for matching without replacement.
+# For matching with replacment, some papers report the characteristics of the unique matched individuals (unweighted matched subjects). This answers: "Who was retained after matching?" It is acceptable, especially if the authors explicitly state that matching was performed with replacement. However, it does not represent the analytical contribution of each subject.
+# For matching with replacment, weighted descriptive statistics summarize the matched pseudo-population. This reflects the actual population analyzed.
+
+
+# Baseline characteristics
+table1m<- mdata %>%
+  select(AGS, GENDER, BMI, HISTOINJ, SURGIND2, PREOPVURGRADE, VURSIDE, UDR7M, 
+         VURPHASE, PREOPTYPEU1, PREOPEPISODE1, PREOPRNPLN, PREOPRNSCR,
+         SURGTECH2, CENTER, TRT2
+  ) %>%
+  tbl_summary(
+    by = TRT2,  # for stratification
+    statistic = list(
+      all_continuous() ~ "{median} ({p25}-{p75})",
+      all_categorical() ~ "{n} ({p}%)" 
+    ),
+    digits = all_categorical() ~ c(0, 1),  # n = 0 decimals, p = 1 decimal
+    missing = "ifany",  # shows missing only when present
+    missing_text = "Missing"
+  ) %>%
+  add_overall() %>%
+  add_p(pvalue_fun = ~style_pvalue(.x, digits = 3)) %>%  #  3 decimals 
+  bold_labels()
+
+table1m
+
+table1m %>%
+  as_flex_table() %>%
+  flextable::save_as_docx(path = "output/baseline_after_matching.docx")
+
+
+
+# Procedural factors
+table2m<- mdata %>%
+  select(TRT2, OPRTIME, STENT, CATH, CATHPERIOD, HOSPTIME) %>%
+  tbl_summary(
+    by = TRT2,  # for stratification
+    statistic = list(
+      all_continuous() ~ "{median} ({p25}-{p75})", # or ~ "{mean} ± {sd}",
+      all_categorical() ~ "{n} ({p}%)" 
+    ),
+    digits = all_categorical() ~ c(0, 1),  # n = 0 decimals, p = 1 decimal
+    missing = "ifany",
+    missing_text = "Missing"
+  ) %>%
+  add_overall() %>%
+  add_p(pvalue_fun = ~style_pvalue(.x, digits = 3)) %>%  #  3 decimals 
+  bold_labels()
+
+table2m
+
+table2m %>%
+  as_flex_table() %>%
+  flextable::save_as_docx(path = "output/procedural_factors_after_matching.docx")
+
+
+# Plot catheterization distribution
+p_m <- ggplot(
+  mdata,
+  aes(
+    x = factor(
+      TRT2,
+      levels = c(0, 1),
+      labels = c("Cohen Group", "Lich-Gregoir Group")
+    ),
+    y = CATHPERIOD
+  )
+) +
+  geom_boxplot() +
+  labs(
+    x = "Treatment Group",
+    y = "Catheterization Duration (days) After Matching"
+  ) +
+  theme_bw()   #optional
+
+ggsave(filename = "figures/catheterization_duration_after_matching.png", 
+       plot = p_m, 
+       width = 8,   # width in inches
+       height = 6,  # height in inches
+       dpi = 300)   # resolution
+
+
+
+# Outcomes
+table3m<- mdata %>%
+  select(TRT2, FUPM, LUTD, OBST, URCOMPINJ, SURG, ILEUS, CLAVIENCLASS, URCOMPCVUR,
+         GU30, GU90, GU90N, GUER30, GUER90, PROC365, 
+         REC011, RECGRADE_MAX, 
+         BLDLOSS, BLDSPASM, HEMAT, 
+         POSTUTI) %>%
+  tbl_summary(
+    by = TRT2,  # for stratification
+    statistic = list(
+      all_continuous() ~ "{median} ({p25}-{p75})", # or ~ "{mean} ± {sd}",
+      all_categorical() ~ "{n} ({p}%)" 
+    ),
+    digits = all_categorical() ~ c(0, 1),  # n = 0 decimals, p = 1 decimal
+    missing = "ifany",
+    missing_text = "Missing"
+  ) %>%
+  add_overall() %>%
+  add_p(pvalue_fun = ~style_pvalue(.x, digits = 3)) %>%  #  3 decimals 
+  bold_labels()
+
+table3m
+
+table3m %>%
+  as_flex_table() %>%
+  flextable::save_as_docx(path = "output/outcomes_after_matching.docx")
+
+
+# Proportion plot for treatment across years (temporal changes in practice)
+p_y_m <- ggplot(
+  mdata,
+  aes(
+    x = factor(YEARS),
+    fill = factor(TRT2,
+                  levels = c(0,1),
+                  labels = c("Cohen Group", "Lich-Gregoir Group"))
+  )
+) +
+  geom_bar(position = "fill") +
+  scale_y_continuous(labels = scales::percent) +
+  scale_fill_manual(values = c(
+    "Cohen Group" = "#ADD8E6",
+    "Lich-Gregoir Group" = "#00008B"
+  )) +
+  labs(x = "Year of Surgery", y = "Proportion", fill = "Group") +
+  theme_bw()
+
+p_y_m
+
+ggsave(filename = "figures/treatment_across_years_after_matching.png", 
+       plot = p_y_m, 
+       width = 8,   # width in inches
+       height = 6,  # height in inches
+       dpi = 300)   # resolution
+
+
+######## Postoperative UTI outcome as time-to-event outcome
+
+# Create labeled TRT2 variable only for survival analysis
+mdata$Treatment <- factor(
+  mdata$TRT2,
+  levels = c(0,1),
+  labels = c("Cohen", "Lich–Gregoir")
+)
+
+surv_object <- Surv(time = mdata$POSTUTIFUP, event = mdata$POSTUTI== 1)
+fit <- survfit(surv_object ~ Treatment , data = mdata)
+
+p_u_m <- ggsurvplot(
+  fit,
+  data = mdata,
+  fun="event",  # Show cumulative incidence (1 - survival)
+  pval = TRUE,
+  pval.size = 4,
+  conf.int = TRUE,
+  risk.table = TRUE,
+
+  xlim = c(0, 135),
+  break.time.by = 12,
+
+  xlab = "Follow-up time",
+  ylab = "Cumulative incidence of 
+      postopetative symptomatic UTI after matching",
+
+  risk.table.y.text = FALSE,   # to remove text from y-axis in the risk table
+  # risk.table.title = "At risk",
+  risk.table.fontsize = 4,   # ontrols numbers in table
+
+  palette = c("#ADD8E6", "#00008B"),
+  ylim = c(0, 1),  # Force y-axis from 0 to 1
+
+  pval.coord = c(0, 0.9)  #  c(x,y) according to my x and y scale
+
+)
+
+# To modify the plot
+p_u_m$plot <- p_u_m$plot + scale_x_continuous(limits = c(0, 135), breaks = seq(0, 135, 12))
+p_u_m$plot <- p_u_m$plot +
+  scale_y_continuous(
+    labels = function(x) paste0(round(x * 100, 1), "%"),
+    limits = c(0, 1)
+  )
+p_u_m$plot <- p_u_m$plot +
+  theme(
+    axis.title.x = element_text(size = 12),
+    axis.title.y = element_text(size = 12),
+    axis.text.x = element_text(size = 10),
+    axis.text.y = element_text(size = 10)
+  )
+
+# To modify the risk table
+p_u_m$table <- p_u_m$table + scale_x_continuous(limits = c(0, 135), breaks = seq(0, 135, 12))
+p_u_m$table <- p_u_m$table +                 
+  theme(
+    axis.title.x = element_blank(),
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    axis.line.x = element_blank(),
+    axis.line.y = element_blank()
+  )
+p_u_m$table <- p_u_m$table +
+  theme(
+    plot.title = element_text(size = 12),
+    text = element_text(size = 10),
+    axis.title.y = element_text(size = 12),
+  )
+# To save plot and risk table using patchwork
+# ggsave() only works with a single ggplot object.
+final_plot_m <- p_u_m$plot / p_u_m$table + plot_layout(heights = c(4, 1))
+ggsave(filename = "figures/UTI_outcome_after_matching.png", final_plot_m, width = 8, height = 6, dpi = 300)
+
+```
+
+
+## 8 Pain descriptive analysis: AFTER matching
+
+```{r pain}
+
+# Filter dataset to only those who did not receive EPIDURAL
+mdatap <- mdata %>%
+  filter(EPIDURAL == "0") %>%
+  mutate(
+    PAIN = factor(
+      PAIN,
+      levels = c("0", "1", "2", "3"),
+      labels = c(
+        "No pain",
+        "Mild pain (score 1-3)",
+        "Moderate pain (score 4-6)",
+        "Severe pain (score 7-10)"
+      )
+    )
+  )
+
+table4m <- mdatap %>%
+  select(PAIN, NARC, NONARC, Treatment) %>%
+  tbl_summary(
+    by = Treatment,
+    statistic = list(
+      all_categorical() ~ "{n} ({p}%)"
+    ),
+    label = list(
+      PAIN ~ "Pain score",
+      NARC ~ "Narcotic use",
+      NONARC ~ "Non-narcotic use"
+    ),
+    digits = all_categorical() ~ c(0, 1),
+    missing = "ifany",
+    missing_text = "Missing"
+  ) %>%
+  add_overall() %>%
+  add_p(pvalue_fun = ~style_pvalue(.x, digits = 3)) %>%
+  bold_labels()
+
+table4m
+
+
+
+table4m %>%
+  as_flex_table() %>%
+  flextable::save_as_docx(path = "output/pain_after_matching.docx")
+
+
+# MERGE TABLES
+table_combined <- tbl_merge(
+  tbls = list(table4, table4m),
+  tab_spanner = c("**Before Matching**", "**After Matching**")
+) %>%
+  modify_caption(
+    "Table 4. Comparison of pain intensity and analgesic use between treatment groups before and after propensity score matching."
+) %>%
+  modify_source_note(
+    "Analysis restricted to patients not receiving epidural analgesia."
+  )
+
+table_combined
+
+table_combined %>%
+  as_flex_table() %>%
+  flextable::save_as_docx(path = "output/pain_before_after.docx")
+
+```
+
+## 9 Pain distribution: BEFORE-AFTER matching - Non-epidural Cohort
+
+```{r painplot}
+
+# label datasets
+before <- Outp %>%
+  mutate(MatchingStatus = "Before matching (N=383), p<0.001")
+
+after <- mdatap %>%
+  mutate(MatchingStatus = "After matching (N=219), p<0.001")
+
+# Combine
+plot_data <- bind_rows(before, after)
+
+
+# pain labels
+plot_data <- plot_data %>%
+  mutate(
+    PAIN_plot = factor(
+      PAIN,
+      levels = levels(PAIN),
+      labels = c("No pain", "Mild pain", "Moderate pain", "Severe pain")
+    )
+  )
+
+# To define order of data
+plot_data <- plot_data %>%
+  mutate(
+    MatchingStatus = factor(
+      MatchingStatus,
+      levels = c(
+        "Before matching (N=383), p<0.001",
+        "After matching (N=219), p<0.001"
+      )
+    )
+  )
+
+# `MatchingStatus` is a character, so ggplot orders it alphabetically:
+# "After matching..." → comes first (A)
+# "Before matching..." → comes second (B)
+# That’s why "After matching" appears on the left → we need to order factor levels to see "After" on the rigt
+
+# Pain distribution stacked by Treatment (within facet)
+
+# summary
+plot_summary <- plot_data %>%
+  group_by(MatchingStatus, Treatment, PAIN_plot) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  group_by(MatchingStatus, Treatment) %>%
+  mutate(Percent = 100 * n / sum(n))
+
+
+s0 <- ggplot(plot_summary, 
+             aes(x = PAIN_plot, y = Percent, fill = Treatment)) +
+  geom_bar(stat = "identity", position = "stack") + 
+  facet_wrap(~MatchingStatus) +
+  labs(x = "
+       1-Day Postoperative Pain Score", 
+       y = "Percentage of Patients not receiving epidural analgesia (%)") +
+  scale_fill_manual(values = c(
+    "Cohen" = "#ADD8E6", 
+    "Lich–Gregoir" = "#00008B"), 
+    name = NULL) +
+  scale_y_continuous(limits = c(0, 100)) +  
+  theme_minimal() +
+  theme(
+    panel.grid = element_blank(),  # Remove gridlines
+    axis.title = element_text(size = 14),  # Set axis labels size
+    axis.text = element_text(size = 8),  # Set axis text size
+    panel.border = element_rect(color = "black", fill = NA),  # Add frame to the plot
+    plot.title = element_text(hjust = 0.5, size = 16),  # Center the title
+    axis.ticks = element_line(size = 0.5, color = "black"),  # Set tick line properties
+    axis.ticks.length = unit(-0.2, "cm"),  # Move ticks inside the plot
+    axis.text.y = element_text(size = 12),  # Adjust the y-axis text size
+    panel.spacing = unit(0, "lines")  # Reduce space between panels
+  )
+
+ggsave(filename = "figures/pain_before_after_matching.png", 
+       plot = s0, 
+       width = 8,   # width in inches
+       height = 6,  # height in inches
+       dpi = 300)   # resolution
+
+
+# 100% stacked grouped bar plot
+
+# summary
+plot_summary1 <- plot_data %>%
+  group_by(MatchingStatus, Treatment, PAIN) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  group_by(MatchingStatus, Treatment) %>%
+  mutate(Percent = 100 * n / sum(n))
+
+s1 <- ggplot(plot_summary1,
+            aes(x = Treatment, y = Percent, fill = PAIN)) +
+  geom_bar(stat = "identity", position = "fill", width = 0.7) +
+  facet_wrap(~MatchingStatus) +
+  labs(
+    x = "
+    Treatment groups",
+    y = "Percentage of patients not receiving epidural analgesia (%)",
+    fill = "1-Day postoperative pain score"
+  ) +
+  scale_fill_manual(values = c(
+  "No pain" = "#f5f5f5",  # Intead of pure white "#ffffff"
+  "Mild pain (score 1-3)" = "#fee8c8",
+  "Moderate pain (score 4-6)" = "#fdbb84",
+  "Severe pain (score 7-10)" = "#e34a33"
+  )) +
+  scale_y_continuous(labels = scales::percent_format(scale = 100)) +
+  theme_minimal() +
+  theme(
+    panel.grid = element_blank(),
+    axis.title = element_text(size = 12),
+    axis.text = element_text(size = 11),
+    panel.border = element_rect(color = "black", fill = NA),
+    strip.text = element_text(face = "bold"),
+    panel.spacing = unit(0, "lines")
+  )
+
+ggsave(
+  filename = "figures/pain_grouped_stacked.png",
+  plot = s1,
+  width = 8,
+  height = 6,
+  dpi = 300
+)
+
+
+# Title: Distribution of pain intensity (score) in treatment groups
+```
+
+
+## 10 Rosenbaum's sensitivity analyses 
+
+```{r sensitivitymv}
+
+mdata <- match.data(m.out)  
+
+
+## One unified sensitivity-analysis framework applied separately but consistently across multiple outcomes.
+  
+
+# Define outcomes
+outcomes <- c("LUTD", "OBST", "URCOMPINJ", "SURG", "ILEUS", "GU30", "GU90", "PROC365")
+
+# Prepare matched sets (1:k)
+mdata <- match.data(m.out)
+mdata$TRT2 <- as.numeric(mdata$TRT2)
+sets <- split(mdata, mdata$subclass)
+
+# Create a reusable function
+run_sensitivity_one_outcome <- function(outcome_var, Gamma_seq) {
+  
+  results <- data.frame()
+  
+  # build Y/Z for sensitivitymv
+  Y <- list()
+  Z <- list()
+  
+  for (i in seq_along(sets)) {
+    
+    df <- sets[[i]]
+    
+    if(length(unique(df$TRT2)) < 2) next
+    
+    Y[[i]] <- df[[outcome_var]]
+    Z[[i]] <- df$TRT2
+  }
+  
+  # loop over Gamma
+  for (g in Gamma_seq) {
+    
+    res <- senmv(
+      ylist = Y,
+      zlist = Z,
+      gamma = g,
+      alternative = "greater"
+    )
+    
+    results <- rbind(results,
+                     data.frame(
+                       outcome = outcome_var,
+                       Gamma = g,
+                       p_value = res$pval
+                     ))
+  }
+  
+  return(results)
+}
+
+# Run all outcomes under SAME Γ grid
+Gamma_seq <- seq(1, 3, by = 0.2)
+
+all_results <- bind_rows(
+  lapply(outcomes, run_sensitivity_one_outcome, Gamma_seq = Gamma_seq)
+)
+
+# Summarize robustness per outcome
+summary_table <- all_results %>%
+  group_by(outcome) %>%
+  summarise(
+    max_gamma_significant = max(Gamma[p_value < 0.05], na.rm = TRUE)
+  )
+
+summary_table
+
+
+# Apply Bonferroni adjustment
+  
+all_results
+# columns: outcome, Gamma, p_value
+
+# Define number of outcomes
+K <- length(unique(all_results$outcome))
+
+# Apply Bonferroni per Gamma level
+all_results_bonf <- all_results %>%
+  mutate(p_bonf = pmin(p_value * K, 1))
+
+# Interpret robustness under Γ
+robustness <- all_results_bonf %>%
+  group_by(outcome) %>%
+  summarise(
+    max_gamma_bonf = max(Gamma[p_bonf < 0.05], na.rm = TRUE)
+  )
+
+robustness
+
+# Global Bonferroni decision
+global_results <- all_results_bonf %>%
+  group_by(Gamma) %>%
+  summarise(min_p = min(p_bonf)) %>%
+  mutate(global_significant = min_p < 0.05)
+
+max_gamma_global <- max(global_results$Gamma[global_results$global_significant])
+max_gamma_global
+
+```
+
+
+## 11 E-value
+
+```{r evalue}
+
+# E-value explains away a specific treatment–outcome association.
+# Code to compute E-value and its confidence interval
+# “Default E-value (vs null)” is simply the standard output when true = 1 (implicitly)
+# For "Non-null E-value (shifted)", use true = ....
+# The E-value for the confidence interval was computed using the limit closest to the null value.
+evalues.OR(est = OR, lo = CI_lower, hi = CI_upper,  rare = TRUE) # rare=TRUE means outcome prevalence <15%
+
+38.84 (15.4 - 97.7)
+0.48 (0.36 - 0.63)
+evalues.OR(est = 0.48,
+           lo = 0.36,
+           hi = 0.63,
+           rare = TRUE)
+
+# If using Cox regression
+evalues.HR(est, lo, hi)
+
+```
+
+
+
+# DRAFT
+
+## Pain descriptive and distribution: BEFORE-AFTER matching - Epidural cohort
+
+```{r}
+
+# Descriptive 
+
+# Filter dataset to only those who did not receive EPIDURAL
+Outp1 <- Out %>%
+  filter(EPIDURAL == "1") %>%
+  mutate(
+    PAIN = factor(
+      PAIN,
+      levels = c("0", "1", "2", "3"),
+      labels = c(
+        "No pain",
+        "Mild pain (score 1-3)",
+        "Moderate pain (score 4-6)",
+        "Severe pain (score 7-10)"
+      )
+    )
+  )
+
+table41 <- Outp1 %>%
+  select(PAIN, NARC, NONARC, Treatment) %>%
+  tbl_summary(
+    by = Treatment,
+    statistic = list(
+      all_categorical() ~ "{n} ({p}%)"
+    ),
+    label = list(
+      PAIN ~ "Pain score",
+      NARC ~ "Narcotic use",
+      NONARC ~ "Non-narcotic use"
+    ),
+    digits = all_categorical() ~ c(0, 1),
+    missing = "ifany",
+    missing_text = "Missing"
+  ) %>%
+  add_overall() %>%
+  add_p(pvalue_fun = ~style_pvalue(.x, digits = 3)) %>%
+  bold_labels()
+
+table41
+
+table41 %>%
+  as_flex_table() %>%
+  flextable::save_as_docx(path = "output/pain_before_matching_epidural.docx")
+
+# ------------------------------
+
+# Filter dataset to only those who did not receive EPIDURAL
+mdatap1 <- mdata %>%
+  filter(EPIDURAL == "1") %>%
+  mutate(
+    PAIN = factor(
+      PAIN,
+      levels = c("0", "1", "2", "3"),
+      labels = c(
+        "No pain",
+        "Mild pain (score 1-3)",
+        "Moderate pain (score 4-6)",
+        "Severe pain (score 7-10)"
+      )
+    )
+  )
+
+
+table4m1 <- mdatap1 %>%
+  select(PAIN, NARC, NONARC, Treatment) %>%
+  tbl_summary(
+    by = Treatment,
+    statistic = list(
+      all_categorical() ~ "{n} ({p}%)"
+    ),
+    label = list(
+      PAIN ~ "Pain score",
+      NARC ~ "Narcotic use",
+      NONARC ~ "Non-narcotic use"
+    ),
+    digits = all_categorical() ~ c(0, 1),
+    missing = "ifany",
+    missing_text = "Missing"
+  ) %>%
+  add_overall() %>%
+  add_p(pvalue_fun = ~style_pvalue(.x, digits = 3)) %>%
+  bold_labels()
+
+table4m1
+
+table4m1 %>%
+  as_flex_table() %>%
+  flextable::save_as_docx(path = "output/pain_after_matching_epidural.docx")
+
+
+# MERGE TABLES
+table_combined1 <- tbl_merge(
+  tbls = list(table41, table4m1),
+  tab_spanner = c("**Before Matching**", "**After Matching**")
+) %>%
+  modify_caption(
+    "Table 4. Comparison of pain intensity and analgesic use between treatment groups before and after propensity score matching."
+) %>%
+  modify_source_note(
+    "Analysis restricted to patients receiving epidural analgesia."
+  )
+
+table_combined1
+
+table_combined1 %>%
+  as_flex_table() %>%
+  flextable::save_as_docx(path = "output/pain_before_after_epidural.docx")
+
+# --------------------------------
+
+# Distribution
+
+
+# label datasets
+before1 <- Outp1 %>%
+  mutate(MatchingStatus = "Before matching (N=383), p<0.001")
+
+after1 <- mdatap1 %>%
+  mutate(MatchingStatus = "After matching (N=219), p<0.001")
+
+# Combine
+plot_data1 <- bind_rows(before1, after1)
+
+
+# pain labels
+plot_data1 <- plot_data1 %>%
+  mutate(
+    PAIN_plot = factor(
+      PAIN,
+      levels = levels(PAIN),
+      labels = c("No pain", "Mild pain", "Moderate pain", "Severe pain")
+    )
+  )
+
+# To define order of data
+plot_data1 <- plot_data1 %>%
+  mutate(
+    MatchingStatus = factor(
+      MatchingStatus,
+      levels = c(
+        "Before matching (N=383), p<0.001",
+        "After matching (N=219), p<0.001"
+      )
+    )
+  )
+
+
+# Pain distribution stacked by Treatment (within facet)
+
+# summary
+plot_summary0 <- plot_data1 %>%
+  group_by(MatchingStatus, Treatment, PAIN_plot) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  group_by(MatchingStatus, Treatment) %>%
+  mutate(Percent = 100 * n / sum(n))
+
+
+s01 <- ggplot(plot_summary0, 
+             aes(x = PAIN_plot, y = Percent, fill = Treatment)) +
+  geom_bar(stat = "identity", position = "stack") + 
+  facet_wrap(~MatchingStatus) +
+  labs(x = "
+       1-Day Postoperative Pain Score", 
+       y = "Percentage of Patients (%)") +
+  scale_fill_manual(values = c(
+    "Cohen" = "#ADD8E6", 
+    "Lich–Gregoir" = "#00008B"), 
+    name = NULL) +
+  scale_y_continuous(limits = c(0, 100)) +  
+  theme_minimal() +
+  theme(
+    panel.grid = element_blank(),  # Remove gridlines
+    axis.title = element_text(size = 14),  # Set axis labels size
+    axis.text = element_text(size = 8),  # Set axis text size
+    panel.border = element_rect(color = "black", fill = NA),  # Add frame to the plot
+    plot.title = element_text(hjust = 0.5, size = 16),  # Center the title
+    axis.ticks = element_line(size = 0.5, color = "black"),  # Set tick line properties
+    axis.ticks.length = unit(-0.2, "cm"),  # Move ticks inside the plot
+    axis.text.y = element_text(size = 12),  # Adjust the y-axis text size
+    panel.spacing = unit(0, "lines")  # Reduce space between panels
+  )
+
+ggsave(filename = "figures/pain_before_after_matching_epidural.png", 
+       plot = s01, 
+       width = 8,   # width in inches
+       height = 6,  # height in inches
+       dpi = 300)   # resolution
+
+# -----------------------------------------
+
+# 100% stacked grouped bar plot
+
+# summary
+plot_summary11 <- plot_data1 %>%
+  group_by(MatchingStatus, Treatment, PAIN) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  group_by(MatchingStatus, Treatment) %>%
+  mutate(Percent = 100 * n / sum(n))
+
+s11 <- ggplot(plot_summary11,
+            aes(x = Treatment, y = Percent, fill = PAIN)) +
+  geom_bar(stat = "identity", position = "fill", width = 0.7) +
+  facet_wrap(~MatchingStatus) +
+  labs(
+    x = "
+    Treatment groups",
+    y = "Percentage of patients (%)",
+    fill = "1-Day postoperative pain score"
+  ) +
+  scale_fill_manual(values = c(
+  "No pain" = "#f5f5f5",
+  "Mild pain (score 1-3)" = "#fee8c8",
+  "Moderate pain (score 4-6)" = "#fdbb84",
+  "Severe pain (score 7-10)" = "#e34a33"
+  )) +
+  scale_y_continuous(labels = scales::percent_format(scale = 100)) +
+  theme_minimal() +
+  theme(
+    panel.grid = element_blank(),
+    axis.title = element_text(size = 12),
+    axis.text = element_text(size = 11),
+    panel.border = element_rect(color = "black", fill = NA),
+    strip.text = element_text(face = "bold"),
+    panel.spacing = unit(0, "lines")
+  )
+
+ggsave(
+  filename = "figures/pain_grouped_stacked_epidural.png",
+  plot = s11,
+  width = 8,
+  height = 6,
+  dpi = 300
+)
+
+
+```
+
+##  Rosenbaum's draft
+
+```{r rosenbaum}
+
+str(mdata)
+
+Outcomes:
+LUTD, OBST, URCOMPINJ, SURG, ILEUS, GU30, GU90, PROC365,
+
+POSTUTI
+
+GU90N, GUER30, GUER90, 
+CLAVIENCLASS, URCOMPCVUR,
+         REC011, RECGRADE_MAX, 
+         BLDLOSS, BLDSPASM, HEMAT, 
+
+
+# For the binary outcome LUTD, and m.out is the MatchIt object 
+# Extract matched pairs for outcomes
+m.pairs <- cbind(
+    mdata[row.names(m.out$match.matrix), 'LUTD'],  
+    mdata[m.out$match.matrix, 'LUTD']
+)
+m.pairs <- na.omit(m.pairs) # filter pairs who did not get matched (NA values)
+print(m.pairs)
+head(m.pairs) # Check the structure of matched pairs
+
+# Count discordant pairs = pairs where one unit (treated or control) has the outcome, but the other does not.
+x <- sum((m.pairs[, 1] == 0) & (m.pairs[, 2] == 1)) # x represent the number of pairs where the control has the outcome, but the treated does not.
+y <- sum((m.pairs[, 1] == 1) & (m.pairs[, 2] == 0)) # y represent the number of pairs where the treated has the outcome, but the control does not.
+print(x)
+print(y) 
+
+# Perform Rosenbaum primal sensitivity analysis
+primal <- binarysens(x=x, y=y, Gamma = 15, GammaInc = 2)
+print(primal)
+
+-----------------------------------------------------------------------
+
+## Rosenbaum sensitivity analysis workflow for 1:k matching
+library(MatchIt)
+library(dplyr)
+
+# Extract matched dataset with subclass (matched set ID)
+matched_data <- match.data(m.out)
+
+# Keep only needed variables
+dat <- matched_data %>%
+  select(subclass, treatment, LUTD)
+
+# Ensure treatment is 0/1
+dat$treatment <- as.numeric(dat$treatment)
+
+# Split by matched sets
+sets <- split(dat, dat$subclass)
+
+# We build a score-like statistic
+library(purrr)
+
+set_stats <- map(sets, function(df) {
+  
+  # treated and control outcomes
+  y_treat <- df$LUTD[df$treatment == 1]
+  y_ctrl  <- df$LUTD[df$treatment == 0]
+  
+  # handle 1:k structure
+  if(length(y_treat) == 0 | length(y_ctrl) == 0) return(NULL)
+  
+  # pairwise comparisons within set
+  # (treated vs all controls average contribution)
+  
+  stat <- mean(y_treat) - mean(y_ctrl)
+  
+  return(stat)
+})
+
+set_stats <- unlist(set_stats)
+
+
+# Convert to Rosenbaum-style test statistic
+T_obs <- sum(set_stats, na.rm = TRUE)
+
+# Sensitivity analysis (Γ model)
+Gamma <- 2  # example sensitivity level
+
+# worst-case weighting within sets
+worst_case_stat <- map_dbl(sets, function(df) {
+  
+  y_treat <- df$LUTD[df$treatment == 1]
+  y_ctrl  <- df$LUTD[df$treatment == 0]
+  
+  if(length(y_treat) == 0 | length(y_ctrl) == 0) return(0)
+  
+  # worst-case allocation logic (simplified Rosenbaum bound idea)
+  weight_t <- Gamma / (1 + Gamma)
+  weight_c <- 1 / (1 + Gamma)
+  
+  (weight_t * mean(y_treat)) - (weight_c * mean(y_ctrl))
+})
+
+T_gamma <- sum(worst_case_stat)
+
+
+# Loop over Γ values
+Gamma_seq <- seq(1, 3, by = 0.2)
+
+results <- data.frame()
+
+for(g in Gamma_seq) {
+  
+  worst_case <- map_dbl(sets, function(df) {
+    
+    y_treat <- df$LUTD[df$treatment == 1]
+    y_ctrl  <- df$LUTD[df$treatment == 0]
+    
+    if(length(y_treat) == 0 | length(y_ctrl) == 0) return(0)
+    
+    w_t <- g / (1 + g)
+    w_c <- 1 / (1 + g)
+    
+    (w_t * mean(y_treat)) - (w_c * mean(y_ctrl))
+  })
+  
+  T_g <- sum(worst_case)
+  
+  results <- rbind(results,
+                   data.frame(Gamma = g,
+                              test_stat = T_g))
+}
+
+# Interpretation: You report: largest Γ where conclusion still holds robustness threshold
+
+-----------------------------------------------------------------------
+
+## Rosenbaum's sensitivity analysis using `sensitivitymv` package
+
+library(sensitivitymv)
+
+# Extract matched data correctly (1:k preserved)
+matched_data <- match.data(m.out)
+
+dat <- matched_data %>%
+  select(subclass, treatment, LUTD)
+
+dat$treatment <- as.numeric(dat$treatment)
+dat$LUTD <- as.numeric(dat$LUTD)
+
+# Split into matched sets
+sets <- split(dat, dat$subclass)
+
+# Create sensitivitymv input structure
+library(purrr)
+
+Y <- list()   # outcomes per set
+Z <- list()   # treatment indicators per set
+
+for (i in seq_along(sets)) {
+  
+  df <- sets[[i]]
+  
+  # skip incomplete sets
+  if(length(unique(df$treatment)) < 2) next
+  
+  Y[[i]] <- df$LUTD
+  Z[[i]] <- df$treatment
+}
+
+# Run Rosenbaum sensitivity analysis (1:k matched sets): for binary outcomes, the common approach is using score-type test statistics inside matched sets.
+
+# Example structure (function name depends on version)
+result <- senmv(
+  ylist = Y,
+  zlist = Z,
+  gamma = 1,
+  alternative = "greater"
+)
+
+Gamma_seq <- seq(1, 3, by = 0.2)
+
+results <- data.frame()
+
+for (g in Gamma_seq) {
+  
+  res <- senmv(
+    ylist = Y,
+    zlist = Z,
+    gamma = g,
+    alternative = "greater"
+  )
+  
+  results <- rbind(results,
+                   data.frame(Gamma = g,
+                              p_value = res$pval))
+}
+
+results
+max_gamma <- max(results$Gamma[results$p_value < 0.05])
+max_gamma
+
+# Interpretation: You report: smallest p-value across Γ or largest Γ where p < 0.05
+
+# For multiple outcomes: You should run Rosenbaum's method separately per outcome → then adjust for multiplicity or Move to joint methods (like sensitivitymult or QCLP papers) (advanced)
+
+
+-----------------------------------------------------------------------------------------------------------
+
+```

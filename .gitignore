@@ -1,0 +1,25 @@
+.Rproj.user
+.Rhistory
+.RData
+.Ruserdata
+.positai
+
+
+
+# R / RStudio / Posit
+.Rproj.user/
+.Rhistory
+.RData
+.Ruserdata
+.positai/
+
+# Research data - DO NOT upload
+data/
+
+# Temporary files
+*.tmp
+*.temp
+
+# OS files
+.DS_Store
+Thumbs.db

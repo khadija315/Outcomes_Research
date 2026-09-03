@@ -1,0 +1,6638 @@
+---
+title: "Outcome_analysis"
+author: "Khadija Ismail"
+date: "`r Sys.Date()`"
+format:
+  pdf:
+    documentclass: article
+    geometry: margin=1in
+    code-overflow: wrap
+    latex-engine: xelatex  # allows better font and color handling
+    highlight-style: kate    # built-in code coloring
+header-includes:
+  - \usepackage{tcolorbox}
+  - |
+    \tcbset{
+      colback=blue!10,
+      colframe=blue!50,
+      boxrule=0.5pt,
+      arc=2mm,
+      left=2mm,
+      right=2mm,
+      top=1mm,
+      bottom=1mm
+    }  
+---
+
+## Create the folders
+
+```{r create folders, eval=FALSE}
+
+dir.create("output")
+dir.create("figures")
+dir.create("reports")
+
+```
+
+## Load necessary libraries
+
+```{r libraries, include = FALSE, warning=FALSE}
+
+library(here)
+library(dplyr)
+library(VIM)
+library(gtsummary)
+library(flextable)
+library(ggplot2)
+library(survival)
+library(survminer)
+library(patchwork)
+library(WeightIt)
+library(readr)
+library(cobalt)
+library(ggsci)
+library(survey)
+library(geepack)
+library(broom)
+library(flextable)
+library(EValue)
+library(MatchIt)
+library(rbounds)
+library(scales)
+library(tidyr)
+library(gt)
+library(DiagrammeR)
+library(htmlwidgets)
+library(webshot2)
+library(DiagrammeRsvg)
+library(rsvg)
+library(emmeans)
+```
+
+## 1 Import data and define variables
+
+```{r import, include = TRUE}
+
+Outcome <- read.csv(
+  here("data", "Outcome_data.csv"),
+  header = TRUE,
+  check.names = FALSE
+)
+
+Outcome <- Outcome %>%
+  mutate(
+    across(c(PID, QCODE), as.character),
+    
+    across(c(AGS, YEARS,BLDLOSS, BMI, CATHPERIOD, FUPM, HOSPTIME,OPRTIME,
+             POSTUTIFUP, POSTUTI_T), as.numeric),
+    
+    across(c(ANASTOMO,BLDCOMPLEAK,BLDCOMPRETN,BLDCOMPVOID,BLDSPASM,CATH,CENTER,
+             CLAVIENCLASS,EPIDURAL,GENDER, GU30, GU90N, GUER30, GUER90, HEMAT, 
+             HISTOINJ,ILEUS, INCCOMPBLEED, INCCOMPINF, INCCOMPSCAR, NARC, 
+             NONARC, PAIN, PREOPEPISODE1, PREOPRNPLN, PREOPRNSCR, PREOPTYPEU1,
+             PREOPVURGRADE, PROC365, STENT, SURGIND, SURGTECH2, TRT2, UDR7M,
+             URCOMPCVUR, URCOMPINJ, URCOMPOBST, URCOMPSTEN, POSTUTI, VURPHASE,
+             VURSIDE, RECGRADE_MAX), as.factor)
+  )
+
+str(Outcome)
+
+```
+
+## 2 Data Imputation using KNN (k-nearest neighbors)
+
+```{r imputation, include = TRUE}
+
+# Missingness in the dataset
+m_outcome <- colSums(is.na(Outcome)) / nrow(Outcome) * 100
+print(m_outcome)
+
+
+# KNN imputation
+Outcome_knn <- Outcome # create a temporary dataset copy for KNN using scaled variables
+
+# Convert categorical variables
+cat_vars <- c(
+  "GENDER","PREOPVURGRADE", "VURPHASE","VURSIDE",
+  "UDR7M","PREOPRNSCR","HISTOINJ","SURGIND",
+  "CENTER","TRT2", "SURGTECH2",
+  "PREOPEPISODE1", "PREOPRNPLN","PREOPTYPEU1"
+)
+Outcome_knn[cat_vars] <- lapply(Outcome_knn[cat_vars], as.factor)
+
+# Scale continuous variables
+continuous_vars <- c("AGS", "BMI", "YEARS")
+Outcome_knn[continuous_vars] <- scale(Outcome_knn[continuous_vars])
+
+
+# KNN imputation without subsetting the dataset
+Outcome_knn <- kNN(
+  Outcome_knn,
+  variable = c("PREOPEPISODE1", "PREOPRNPLN", "PREOPTYPEU1"),  # Variables to impute
+  dist_var = c("AGS","GENDER","BMI", # Variables used to compute patient similarity
+    "PREOPVURGRADE","VURPHASE","VURSIDE","UDR7M",
+    "PREOPRNSCR","HISTOINJ","SURGIND","YEARS",
+    "TRT2"
+  ),
+  k = 5,
+  imp_var = FALSE
+)
+
+
+Out <- Outcome   # New dataset for analysis including imputed variables 
+Out$PREOPEPISODE1 <- Outcome_knn$PREOPEPISODE1
+Out$PREOPRNPLN   <- Outcome_knn$PREOPRNPLN
+Out$PREOPTYPEU1  <- Outcome_knn$PREOPTYPEU1
+```
+
+## 3 Recode and create (composite) variables
+
+```{r recode}
+
+# Recode SURGIND into SURGIND2
+
+Out <- Out %>%
+  mutate(
+    SURGIND2 = case_when(
+      SURGIND == 4 ~ 1,
+      SURGIND == 3 ~ 2,
+      SURGIND == 1 ~ 3,
+      SURGIND == 2 ~ 4,
+      SURGIND %in% c(5, 6, 7, 8, 9, 10, 11) ~ 5,
+      TRUE ~ NA_real_
+    ),
+    SURGIND2 = factor(SURGIND2)
+  )
+
+
+# Create a new variable LUTD by combining BLDCOMPRETN, BLDCOMPVOID, BLDCOMPLEAK
+Out <- Out %>%
+  mutate(
+    LUTD = case_when(
+      BLDCOMPRETN == 1 |
+      BLDCOMPVOID == 1 |
+      BLDCOMPLEAK == 1 ~ 1,
+
+      BLDCOMPRETN == 0 &
+      BLDCOMPVOID == 0 &
+      BLDCOMPLEAK == 0 ~ 0,
+
+      TRUE ~ NA_real_
+    ),
+    LUTD = factor(LUTD)
+  )
+
+
+# Create a new variable OBST by combining URCOMPOBST, URCOMPSTEN, ANASTOMO
+Out <- Out %>%
+  mutate(
+    OBST = case_when(
+      URCOMPOBST == 1 |
+      URCOMPSTEN == 1 |
+      ANASTOMO == 1 ~ 1,
+
+      URCOMPOBST == 0 &
+      URCOMPSTEN == 0 &
+      ANASTOMO == 0 ~ 0,
+
+      TRUE ~ NA_real_
+    ),
+    OBST = factor(OBST)
+  )
+
+
+# Create a new variable SURG by combining INCCOMPBLEED, INCCOMPINF, INCCOMPSCAR
+Out <- Out %>%
+  mutate(
+    SURG = case_when(
+      INCCOMPBLEED == 1 |
+      INCCOMPINF == 1 |
+      INCCOMPSCAR == 1 ~ 1,
+
+      INCCOMPBLEED == 0 &
+      INCCOMPINF == 0 &
+      INCCOMPSCAR == 0 ~ 0,
+
+      TRUE ~ NA_real_
+    ),
+    SURG = factor(SURG)
+  )
+
+# Create a new variable GU90 by combining no readmission (0) and planned readmission (2)
+Out <- Out %>%
+  mutate(
+    GU90 = recode(as.character(GU90N),
+                  "0" = "0",
+                  "1" = "1",
+                  "2" = "0"),
+    GU90 = factor(GU90)
+  )
+
+
+# Create a categorical variable CATHPERIOD_G for the numerical variable CATHPERIOD
+Out <- Out %>%
+  mutate(CATHPERIOD_G = case_when(
+    CATHPERIOD <= 3 ~ "Early removal ≤3 days",
+    CATHPERIOD > 3 & CATHPERIOD <= 7 ~ "Standard removal 4–7 days",
+    CATHPERIOD > 7 ~ "Delayed removal >7 days",
+  ))
+
+Out$CATHPERIOD_G <- factor(
+  Out$CATHPERIOD_G, 
+  levels = c("Early removal ≤3 days", "Standard removal 4–7 days", "Delayed removal >7 days")
+)
+
+
+# Recode complications
+
+comp_vars <- c(
+  "LUTD",
+  "OBST",
+  "URCOMPINJ",
+  "SURG",
+  "ILEUS"
+)
+
+Out[comp_vars] <- lapply(
+  Out[comp_vars],
+  function(x) as.numeric(as.character(x))
+)
+
+Out$ANY <- as.numeric(
+  rowSums(
+    Out[, comp_vars],
+    na.rm = TRUE
+  ) > 0
+)
+
+minor_vars <- c(
+  "LUTD",
+  "SURG",
+  "ILEUS"
+)
+
+Out$MINOR <- as.numeric(
+  rowSums(
+    Out[, minor_vars],
+    na.rm = TRUE
+  ) > 0
+)
+
+
+major_vars <- c(
+  "OBST",
+  "URCOMPINJ"
+)
+
+Out$MAJOR <- as.numeric(
+  rowSums(
+    Out[, major_vars],
+    na.rm = TRUE
+  ) > 0
+)
+
+
+# Convert variables to appropriate data types for analysis
+Out <- Out %>%
+  mutate(
+    across(c(PID, QCODE), as.character),
+    
+    across(c(AGS, YEARS,BLDLOSS, BMI, CATHPERIOD, FUPM, HOSPTIME,OPRTIME,
+             POSTUTIFUP, POSTUTI_T), as.numeric),
+    
+    across(c(ANASTOMO,BLDCOMPLEAK,BLDCOMPRETN,
+             BLDCOMPVOID,BLDSPASM,CATH,CENTER,CLAVIENCLASS,EPIDURAL,GENDER,
+             GU30, GU90N, GUER30, GUER90, HEMAT, 
+             HISTOINJ,ILEUS, INCCOMPBLEED, INCCOMPINF, INCCOMPSCAR, NARC, 
+             NONARC, PAIN, PREOPEPISODE1, PREOPRNPLN, PREOPRNSCR, PREOPTYPEU1,
+             PREOPVURGRADE, PROC365, STENT, SURGIND, SURGTECH2, TRT2, UDR7M,
+             URCOMPCVUR, URCOMPINJ, URCOMPOBST, URCOMPSTEN, POSTUTI, VURPHASE,
+             VURSIDE, RECGRADE_MAX, SURGIND2, LUTD, OBST, SURG, GU90,
+             CATHPERIOD_G, ANY, MINOR, MAJOR), as.factor)
+  )
+
+str(Out)
+
+
+
+```
+
+
+## 4 Descriptive analysis: BEFORE weighting and matching
+
+```{r descriptive, warning=FALSE}
+
+# Baseline characteristics
+table1<- Out %>%
+  mutate(YEARS = factor(YEARS)) %>%   # Convert only within this pipeline  
+  dplyr::select(YEARS, AGS, GENDER, BMI, HISTOINJ, SURGIND2, PREOPVURGRADE, VURSIDE, UDR7M, 
+         VURPHASE, PREOPTYPEU1, PREOPEPISODE1, PREOPRNPLN, PREOPRNSCR,
+         SURGTECH2, CENTER, TRT2
+  ) %>%
+  tbl_summary(
+    by = TRT2,  # for stratification
+    statistic = list(
+      all_continuous() ~ "{median} ({p25}-{p75})",
+      all_categorical() ~ "{n} ({p}%)" 
+    ),
+    digits = all_categorical() ~ c(0, 1),  # n = 0 decimals, p = 1 decimal
+    missing = "ifany",  # shows missing only when present
+    missing_text = "Missing"
+  ) %>%
+  add_overall() %>%
+  add_p(
+    test = list(
+      YEARS ~ "chisq.test"
+    ),  
+  pvalue_fun = ~style_pvalue(.x, digits = 3)) %>%  #  3 decimals 
+  bold_labels()
+
+table1
+
+table1 %>%
+  as_flex_table() %>%
+  flextable::save_as_docx(path = "output/baseline.docx")
+
+
+# Baseline characteristics
+table1b<- Out %>%
+  dplyr::select(YEARS, AGS, GENDER, BMI, HISTOINJ, SURGIND2, PREOPVURGRADE, VURSIDE, UDR7M, 
+         VURPHASE, PREOPTYPEU1, PREOPEPISODE1, PREOPRNPLN, PREOPRNSCR,
+         SURGTECH2, CENTER, TRT2
+  ) %>%
+  tbl_summary(
+    by = TRT2,  # for stratification
+    statistic = list(
+      all_continuous() ~ "{median} ({p25}-{p75})",
+      all_categorical() ~ "{n} ({p}%)" 
+    ),
+    digits = all_categorical() ~ c(0, 1),  # n = 0 decimals, p = 1 decimal
+    missing = "ifany",  # shows missing only when present
+    missing_text = "Missing"
+  ) %>%
+  add_overall() %>%
+  add_p(pvalue_fun = ~style_pvalue(.x, digits = 3)) %>%  #  3 decimals 
+  bold_labels()
+
+table1b
+
+table1b %>%
+  as_flex_table() %>%
+  flextable::save_as_docx(path = "output/baseline2.docx")
+
+
+# Procedural factors
+table2<- Out %>%
+  dplyr::select(TRT2, OPRTIME, STENT, CATH, CATHPERIOD, CATHPERIOD_G,HOSPTIME) %>%
+  tbl_summary(
+    by = TRT2,  # for stratification
+    statistic = list(
+      all_continuous() ~ "{median} ({p25}-{p75})", # or ~ "{mean} ± {sd}",
+      all_categorical() ~ "{n} ({p}%)" 
+    ),
+    digits = all_categorical() ~ c(0, 1),  # n = 0 decimals, p = 1 decimal
+    missing = "ifany",
+    missing_text = "Missing"
+  ) %>%
+  add_overall() %>%
+  add_p(pvalue_fun = ~style_pvalue(.x, digits = 3)) %>%  #  3 decimals 
+  bold_labels()
+
+table2
+
+table2 %>%
+  as_flex_table() %>%
+  flextable::save_as_docx(path = "output/procedural.docx")
+
+  
+# Outcomes
+table3<- Out %>%
+  dplyr::select(TRT2, FUPM, LUTD, OBST, URCOMPINJ, SURG, ILEUS, CLAVIENCLASS, URCOMPCVUR,
+         GU30, GU90, GU90N, GUER30, GUER90, PROC365, 
+         BLDLOSS, BLDSPASM, HEMAT, 
+         POSTUTI) %>%
+  tbl_summary(
+    by = TRT2,  # for stratification
+    statistic = list(
+      all_continuous() ~ "{median} ({p25}-{p75})", # or ~ "{mean} ± {sd}",
+      all_categorical() ~ "{n} ({p}%)" 
+    ),
+    digits = all_categorical() ~ c(0, 1),  # n = 0 decimals, p = 1 decimal
+    missing = "ifany",
+    missing_text = "Missing"
+  ) %>%
+  add_overall() %>%
+  add_p(pvalue_fun = ~style_pvalue(.x, digits = 3)) %>%  #  3 decimals 
+  bold_labels()
+
+table3
+
+table3 %>%
+  as_flex_table() %>%
+  flextable::save_as_docx(path = "output/outcomes.docx")
+
+
+## Treatment distribution change over time using a chi-square test
+
+tab_year <- table(Out$YEARS, Out$Treatment)
+
+chisq.test(tab_year)
+
+p_value_year <- chisq.test(tab_year)$p.value
+
+p_label <- ifelse(
+  p_value_year < 0.001,
+  "Chi-square p < 0.001",
+  paste0(
+    "Chi-square p = ",
+    format.pval(p_value_year, digits = 3)
+  )
+)
+
+p_label 
+
+# Proportion plot for treatment across 
+
+plot_data1 <- Out %>%
+  count(YEARS, Treatment) %>%
+  group_by(Treatment) %>%
+  mutate(
+    Percent = 100 * n / sum(n)
+  ) %>%
+  ungroup()
+
+pt <- ggplot(
+  plot_data1,
+  aes(
+    x = Percent,
+    y = factor(YEARS),
+    fill = Treatment
+  )
+) +
+  geom_col(
+    position = position_dodge(width = 0.8),
+    width = 0.7,
+    colour = "black"
+  ) +
+  scale_x_continuous(
+    limits = c(0, 100),
+    breaks = seq(0, 100, 20),
+    expand = expansion(mult = c(0, 0.02))
+  ) +
+  scale_fill_viridis_d(option = "mako", begin = 0.3, end = 0.8) +
+  labs(
+    x = "Proportion",
+    y = "Year of Surgery",
+    fill = "Treatment Group"
+  ) +
+  annotate(
+    "text",
+    x = 70,
+    y = Inf,
+    label = p_label,
+    vjust = 1.5,
+    size = 4
+  ) +
+  theme_classic()
+
+pt
+
+ggsave(filename = "figures/treatment.png", 
+       plot = pt, 
+       width = 8,   # width in inches
+       height = 10,  # height in inches
+       dpi = 300)   # resolution
+
+
+######## Postoperative UTI outcome as time-to-event outcome
+
+# Create labeled TRT2 variable only for survival analysis
+Out$Treatment <- factor(
+  Out$TRT2,
+  levels = c(0,1),
+  labels = c("Cohen", "Lich–Gregoir")
+)
+
+surv_object <- Surv(time = Out$POSTUTIFUP, event = Out$POSTUTI== 1)
+fit <- survfit(surv_object ~ Treatment , data = Out)
+
+p_u <- ggsurvplot(
+  fit,
+  data = Out,
+  fun="event",  # Show cumulative incidence (1 - survival)
+  pval = FALSE,
+  pval.size = 4,
+  pval.coord = c(0, 0.9),  #  c(x,y) according to my x and y scale
+  conf.int = TRUE,
+  risk.table = TRUE,
+  risk.table.y.text = FALSE,   # to remove text from y-axis in the risk table
+  # risk.table.title = "At risk",
+  risk.table.fontsize = 4,   # ontrols numbers in table
+  xlim = c(0, 135),
+  break.time.by = 12,
+  xlab = "Follow-up time",
+  ylab = "Cumulative incidence of postopetative symptomatic UTI",
+  palette = c("#482878", "#2E8B8B"),    # instead of "#ADD8E6", "#00008B"
+  legend.title = "Treatment",
+  legend.labs = c("Cohen Group", "Lich-Gregoir Group"),
+  ylim = c(0, 1) # Force y-axis from 0 to 1
+)
+
+# calculate P-value from ggsurvplot (pval = TRUE), then turn it off
+
+p_u$plot <- p_u$plot +
+  annotate(
+    "text",
+    x = 20,
+    y = 0.90,
+    label = "Log rank test p = 0.058",
+    size = 4
+  )
+
+#-----------------------
+# Customize the plot
+#-----------------------
+p_u$plot <- p_u$plot +
+  scale_x_continuous(
+    limits = c(0, 135),
+    breaks = seq(0, 135, 12)
+  ) +
+  scale_y_continuous(
+    labels = function(x) paste0(round(x * 100, 1), "%"),
+    limits = c(0, 1)
+  ) +
+  theme_classic() +   # Many clinical epidemiology journals prefer theme_classic() instead of theme_bw() as it automatically removes all gridlines
+  theme(
+    axis.title.x = element_text(size = 12),
+    axis.title.y = element_text(size = 12),
+    axis.text.x  = element_text(size = 10),
+    axis.text.y  = element_text(size = 10),
+    legend.title = element_text(size = 11),
+    legend.text  = element_text(size = 10)
+  )
+
+p_u$plot <- p_u$plot +
+  labs(title = "(A) Before overlap weighting")
+
+#----------------------------
+# Customize the risk table
+#----------------------------
+p_u$table <- p_u$table +
+  scale_x_continuous(
+    limits = c(0, 135),
+    breaks = seq(0, 135, 12)
+  ) +
+  theme(
+    axis.title.x = element_blank(),
+    axis.text.x  = element_blank(),
+    axis.ticks.x = element_blank(),
+    axis.line.x  = element_blank(),
+    axis.line.y  = element_blank(),
+    plot.title   = element_text(size = 12),
+    text         = element_text(size = 10),
+    axis.title.y = element_text(size = 12)
+  )
+
+#------------------------------------------------------------
+# Combine plot and risk table using patchwork
+#------------------------------------------------------------
+final_plot <- p_u$plot / p_u$table +
+  plot_layout(heights = c(4, 1))
+
+
+#------------------------------------------------------------
+# Save the figure
+#------------------------------------------------------------
+ggsave(
+  filename = "figures/UTI.png",
+  plot = final_plot,
+  width = 8,
+  height = 6,
+  dpi = 300
+)
+
+
+
+# The estimated 1-year cumulative probability of UTI
+
+s <- summary(fit, times = 12)
+
+uti_1yr <- data.frame(
+  Treatment = s$strata,
+  UTI_1yr = 1 - s$surv,
+  Lower_95CI = 1 - s$upper,
+  Upper_95CI = 1 - s$lower
+)
+
+
+uti_1yr$UTI_1yr <- 100 * uti_1yr$UTI_1yr
+uti_1yr$Lower_95CI <- 100 * uti_1yr$Lower_95CI
+uti_1yr$Upper_95CI <- 100 * uti_1yr$Upper_95CI
+
+uti_1yr
+
+```
+
+# MAIN ANALYSIS
+
+### 1 Do weighting: using ATO
+
+```{r weightingATO}
+
+set.seed(123)
+
+w.out <- weightit(
+  TRT2 ~ AGS + YEARS + GENDER + BMI + PREOPRNPLN + HISTOINJ +
+    SURGIND2 + PREOPVURGRADE + VURSIDE + UDR7M + VURPHASE +
+    PREOPEPISODE1 + PREOPTYPEU1 + PREOPRNSCR + SURGTECH2,
+  data = Out,
+  method = "ps",
+  estimand = "ATO",   
+  stabilize = FALSE 
+)
+Out$weights <- w.out$weights  # Add weights to the dataset
+write.csv(Out, "data/weighted_data.csv", row.names = FALSE)
+
+summary(w.out$weights)
+
+
+# Table for balance
+bal <- cobalt::bal.tab(w.out, un = TRUE, ESS = TRUE, m.threshold = 0.1)  
+bal 
+
+bal_df <- as.data.frame(bal$Balance)
+smd_table <- bal_df %>%
+  mutate(
+    Variable = rownames(bal_df),
+    SMD_Before = round(abs(Diff.Un), 3),   
+    SMD_After  = round(abs(Diff.Adj), 3)
+  ) %>% 
+  dplyr::select(Variable, SMD_Before, SMD_After)
+
+smd_table %>%
+  flextable() %>%
+  save_as_docx(path = "output/SMD_w.docx")
+
+
+# Figure for balance - Love plot
+pl <- love.plot(
+  w.out,
+  threshold = 0.1,
+  abs = TRUE, 
+  stats = "mean.diffs",      
+  var.order = "unadjusted", 
+  drop.distance = TRUE, 
+  sample.names = c("Before overlap weighting", "After overlap weighting"),
+  size = 4,
+    var.names = c(
+    AGS = "Age at surgery",
+    YEARS = "Year of surgery",
+    BMI = "Body mass index",
+    GENDER = "Female gender",
+    PREOPRNPLN = "Preop pyelonephritis",
+    HISTOINJ = "History of injection",
+    VURSIDE = "Right-sided VUR",
+    UDR7M = "Ureteral dilation ≥ 7mm",
+    PREOPTYPEU1 = "Preop febrile UTIs",
+    PREOPRNSCR = "Preop renal scarring",
+    VURPHASE_1 = "Reflux: voiding phase",
+    VURPHASE_2 = "Reflux: filling phase",
+    VURPHASE_3 = "Reflux: filling + voiding",
+    SURGTECH2_1 = "Surgeon experience ≥100 operations",
+    SURGTECH2_2 = "Surgeon experience 50-100 operations",
+    SURGTECH2_3 = "Surgeon experience <50 operations",
+    PREOPEPISODE1_1 = "Preop UTI episodes: 1",
+    PREOPEPISODE1_2 = "Preop UTI episodes: 2",
+    PREOPEPISODE1_3 = "Preop UTI episodes: ≥3",
+    SURGIND2_1 = "Indication: breakthrough UTI",
+    SURGIND2_2 = "Indication: high-grade reflux (III-V)",
+    SURGIND2_3 = "Indication: poor compliance to medical treatment",
+    SURGIND2_4 = "Indication: ineffective/poorly tolerated CAP",
+    SURGIND2_5 = "Indication: other",
+    PREOPVURGRADE_3 = "Preop VUR grade: III",
+    PREOPVURGRADE_4 = "Preop VUR grade: IV",
+    PREOPVURGRADE_5 = "Preop VUR grade: V"
+  )
+  )
+
+pl <- pl +
+    scale_color_manual(
+    values = c(
+      "Before overlap weighting" = "#0072B2",
+      "After overlap weighting" = "#D55E00"
+    )
+  ) +
+    labs(
+      x = "Absolute Standardized Differences",
+      subtitle = "Overlap population of all children"
+  ) +
+    theme(
+      plot.margin = margin(10, 10, 10, 10),
+      axis.text = element_text(size = 16),
+      axis.title = element_text(size = 16),
+      plot.title = element_text(size = 16),
+      legend.text = element_text(size = 16),
+      legend.title = element_text(size = 16),
+      axis.ticks = element_line(size = 0.5, color = "black"),
+      axis.line = element_line(size = 0.5, color = "black"),
+      panel.background = element_blank(), 
+      panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank(),
+      panel.border = element_blank(),
+      axis.ticks.length = unit(0.3, "cm"),
+      panel.spacing = unit(2, "lines")
+   )
+
+ggsave ("figures/love_plot_w.png", plot = pl, width = 12, height = 10, dpi = 300)
+
+# Compute mean SMD
+smd_df <- bal$Balance
+mean_smd_before <- mean(abs(smd_df$Diff.Un), na.rm = TRUE) # calculate mean SMD before matching
+mean_smd_after <- mean(abs(smd_df$Diff.Adj), na.rm = TRUE) # calculate mean SMD before matching
+mean_smd <- data.frame(
+  Mean_SMD_Before = mean_smd_before,
+  Mean_SMD_After = mean_smd_after
+)
+
+mean_smd
+
+# how much effective sample size remains (overall ESS: calculated manually)?
+summary(w.out$weights)
+bal.tab(w.out)$Effective.Sample.Size
+sum(w.out$weights)^2 / sum(w.out$weights^2)
+
+
+# propensity score distribution
+summary(w.out$ps)
+pl2 <-plot(summary(w.out, type = "hist"))
+ggsave ("figures/propensity_w.png", plot = pl2, width = 12, height = 10, dpi = 300)
+
+
+# Distribution of overlap weights: histogram and density
+
+## Histogram
+summary(w.out$weights)
+png("figures/weights_histo_w.png",
+    width = 6,
+    height = 4,
+    units = "in",
+    res = 300)
+
+hist(
+  w.out$weights,
+  breaks = 30,
+  col = "lightblue",
+  border = "black",
+  main = "Distribution of Overlap Weights",
+  xlab = "Overlap Weight"
+)
+dev.off()
+
+
+
+# Before-After weighting
+p_ps <- bal.plot(
+  w.out,
+  var.name = "prop.score",
+  type = "density",
+  which = "both"
+) 
+
+p_ps <- p_ps +
+  scale_color_viridis_d(
+    option = "mako",
+    begin = 0.3,
+    end = 0.8,
+    labels = c("Cohen group", "Lich–Gregoir group")
+  ) +
+  scale_fill_viridis_d(
+    option = "mako",
+    begin = 0.3,
+    end = 0.8,
+    labels = c("Cohen group", "Lich–Gregoir group")
+  )
+
+ggsave(
+  "figures/PS_density_before_after_ATO.png",
+  p_ps,
+  width = 10,
+  height = 7,
+  dpi = 300
+)
+
+```
+
+### 2 Descriptive analysis: AFTER weighting
+
+```{r descriptivew, warning=FALSE}
+
+# Create survey design object using overlap weights
+design_ato <- svydesign(
+  ids = ~1, 
+  data = Out,
+  weights = ~weights
+)
+
+# Weighted baseline characteristics
+table1w <- design_ato %>%
+  tbl_svysummary(
+    by = TRT2,    
+    include = c(
+      YEARS, AGS, GENDER, BMI, HISTOINJ, SURGIND2, PREOPVURGRADE, VURSIDE, UDR7M, 
+         VURPHASE, PREOPTYPEU1, PREOPEPISODE1, PREOPRNPLN, PREOPRNSCR,
+         SURGTECH2, CENTER  
+  ),
+    statistic = list(
+      all_continuous() ~ "{median} ({p25}-{p75})",
+      all_categorical() ~ "{n} ({p}%)"
+    ),
+    digits = all_categorical() ~ c(0, 1),
+    missing = "ifany",  
+    missing_text = "Missing"
+  ) %>%
+  add_overall() %>%
+  bold_labels()
+
+table1w
+
+table1w %>%
+  as_flex_table() %>%
+  flextable::save_as_docx(
+    path = "output/baseline_w.docx"
+  )
+
+
+# Weighted procedural factors
+table2w<- design_ato %>%
+  tbl_svysummary(
+    by = TRT2,  # for stratification
+    include = c (
+      OPRTIME, STENT, CATH, CATHPERIOD, CATHPERIOD_G, HOSPTIME
+    ),
+    statistic = list(
+      all_continuous() ~ "{median} ({p25}-{p75})", # or ~ "{mean} ± {sd}",
+      all_categorical() ~ "{n} ({p}%)" 
+    ),
+    digits = all_categorical() ~ c(0, 1),  # n = 0 decimals, p = 1 decimal
+    missing = "ifany",
+    missing_text = "Missing"
+  ) %>%
+  add_overall() %>%
+  add_p(pvalue_fun = ~style_pvalue(.x, digits = 3)) %>%  #  3 decimals 
+  bold_labels()
+
+table2w
+
+table2w %>%
+  as_flex_table() %>%
+  flextable::save_as_docx(path = "output/procedural_w.docx")
+
+
+# Outcomes
+table3w<- design_ato %>%
+  tbl_svysummary(
+    by = TRT2, 
+    include = c (
+      FUPM, LUTD, OBST, URCOMPINJ, SURG, ILEUS, CLAVIENCLASS, URCOMPCVUR,
+         GU30, GU90, GU90N, GUER30, GUER90, PROC365, 
+         BLDLOSS, BLDSPASM, HEMAT, POSTUTI
+    ),
+    statistic = list(
+      all_continuous() ~ "{median} ({p25}-{p75})", # or ~ "{mean} ± {sd}",
+      all_categorical() ~ "{n} ({p}%)" 
+    ),
+    digits = all_categorical() ~ c(0, 1),  # n = 0 decimals, p = 1 decimal
+    missing = "ifany",
+    missing_text = "Missing"
+  ) %>%
+  add_overall() %>%
+  add_p(pvalue_fun = ~style_pvalue(.x, digits = 3)) %>%  #  3 decimals 
+  bold_labels()
+
+table3w
+
+table3w %>%
+  as_flex_table() %>%
+  flextable::save_as_docx(path = "output/outcomes_w.docx")
+
+
+
+######## Postoperative UTI outcome as time-to-event outcome: Weighted survival curve
+
+fit_w <- survfit(
+  Surv(POSTUTIFUP, POSTUTI == 1) ~ Treatment,
+  data = Out,
+  weights = w.out$weights
+)
+
+p_u_w <- ggsurvplot(
+  fit_w,
+  data = Out,
+  fun = "event",
+  pval = FALSE,
+  pval.size = 4,
+  pval.coord = c(0, 0.9),  #  c(x,y) according to my x and y scale
+  conf.int = TRUE,
+  risk.table = TRUE,
+  risk.table.y.text = FALSE,   # to remove text from y-axis in the risk table
+  risk.table.fontsize = 4,   # controls numbers in table
+  xlim = c(0,135),
+  break.time.by = 12,
+  xlab = "Follow-up time",
+  ylab = "Cumulative incidence of postoperative symptomatic UTI",
+  palette = c("#482878", "#2E8B8B"),    # instead of "#ADD8E6", "#00008B"
+  legend.title = "Treatment",
+  legend.labs = c("Cohen Group", "Lich-Gregoir Group"),
+  ylim = c(0,1)
+)
+
+cox_w <- svycoxph(
+  Surv(POSTUTIFUP, POSTUTI == 1) ~ Treatment,
+  design = design_ato
+)
+
+summary(cox_w)
+
+p_u_w$plot <- p_u_w$plot +
+  annotate(
+    "text",
+    x = 20,
+    y = 0.90,
+    label = "Weighted Cox p = 0.250",
+    size = 4
+  )
+
+#-----------------------
+# Customize the plot
+#-----------------------
+p_u_w$plot <- p_u_w$plot +
+  scale_x_continuous(
+    limits = c(0, 135),
+    breaks = seq(0, 135, 12)
+  ) +
+  scale_y_continuous(
+    labels = function(x) paste0(round(x * 100, 1), "%"),
+    limits = c(0, 1)
+  ) +
+  theme_classic() +   # Many clinical epidemiology journals prefer theme_classic() instead of theme_bw() as it automatically removes all gridlines
+  theme(
+    axis.title.x = element_text(size = 12),
+    axis.title.y = element_text(size = 12),
+    axis.text.x  = element_text(size = 10),
+    axis.text.y  = element_text(size = 10),
+    legend.title = element_text(size = 11),
+    legend.text  = element_text(size = 10)
+  )
+
+
+p_u_w$plot <- p_u_w$plot +
+  labs(title = "(B) After overlap weighting")
+
+
+#----------------------------
+# Customize the risk table
+#----------------------------
+p_u_w$table <- p_u_w$table +
+  scale_x_continuous(
+    limits = c(0, 135),
+    breaks = seq(0, 135, 12)
+  ) +
+  theme(
+    axis.title.x = element_blank(),
+    axis.text.x  = element_blank(),
+    axis.ticks.x = element_blank(),
+    axis.line.x  = element_blank(),
+    axis.line.y  = element_blank(),
+    plot.title   = element_text(size = 12),
+    text         = element_text(size = 10),
+    axis.title.y = element_text(size = 12)
+  )
+
+#------------------------------------------------------------
+# Combine plot and risk table
+#------------------------------------------------------------
+final_plot_w <- p_u_w$plot / p_u_w$table +
+  plot_layout(heights = c(4, 1))
+
+
+
+#------------------------------------------------------------
+# Save the figure
+#------------------------------------------------------------
+ggsave(
+  filename = "figures/UTI_w.png",
+  plot = final_plot_w,
+  width = 8,
+  height = 6,
+  dpi = 300
+)
+
+
+
+# Combine UTI before and after weighting plots
+
+UTI_combined <- final_plot | final_plot_w
+
+ggsave(
+  filename = "figures/UTI_ba_w.png",
+  plot = UTI_combined,
+  width = 16,
+  height = 6,
+  dpi = 300
+)
+
+
+
+# Estimated 1-year survival
+s_w <- summary(fit_w, times = 12, extend = TRUE)  # # The extend = TRUE is useful if there isn't an event exactly at 365 days.
+
+# Estimated 1-year cumulative probability of UTI
+uti_1yr_w <- data.frame(
+  Treatment = s_w$strata,
+  UTI_1yr = 100 * (1 - s_w$surv),
+  Lower_95CI = 100 * (1 - s_w$upper),
+  Upper_95CI = 100 * (1 - s_w$lower)
+)
+
+uti_1yr_w
+
+```
+
+
+### 3 Regression models
+
+#### Block 1
+
+```{r reg1w_norec, warning=FALSE}
+
+# GEE model after overlap weighting - Accounting for center-clustering
+
+# Block 1: technique effect on postoperative outcomes = Univariable analyses
+
+outcomes <- c(
+  "LUTD",
+  "OBST",
+  "URCOMPINJ",
+  "SURG",
+  "ILEUS",
+  "GU30",
+  "GU90",
+  "PROC365"
+)
+
+# convert outcomes to numeric
+Out[outcomes] <- lapply(
+  Out[outcomes],
+  function(x) as.numeric(as.character(x))
+)
+
+# Apply GEE model after overlap weighting for all binary outcomes
+gee_results <- lapply(outcomes, function(y) {
+  formula <- as.formula(
+    paste(y, "~ TRT2")
+  )
+  model <- geeglm(
+    formula,
+    data = Out,
+    id = CENTER,
+    weights = weights,
+    family = binomial(link = "logit"),
+    corstr = "exchangeable"
+  )
+  tidy(model, exponentiate = TRUE, conf.int = TRUE)   # estimate = OR because exponentiate = TRUE
+})
+names(gee_results) <- outcomes
+
+
+# Combine results into one table
+gee_table <- do.call(
+  rbind,
+  lapply(names(gee_results), function(x){
+    tmp <- gee_results[[x]]
+    tmp <- tmp %>%
+      filter(grepl("^TRT2", term)) %>%
+      mutate(outcome = x)
+    tmp
+  })
+)
+
+# Create final manuscript table
+gee_table_final <- gee_table %>%
+  mutate(
+    Effect_measure = "OR",
+    Estimate = sprintf("%.2f", estimate),
+    CI = paste0(
+      sprintf("%.2f", conf.low),
+      "–",
+      sprintf("%.2f", conf.high)
+    ),
+    P_value = p.value
+  ) %>%
+  dplyr::select(
+    Outcome = outcome,
+    Effect_measure,
+    Estimate,
+    CI,
+    P_value
+  )
+
+# weighted Cox model for POSTUTI
+
+cox_uti <- svycoxph(
+  Surv(POSTUTIFUP, POSTUTI == 1) ~ TRT2 + strata(CENTER),
+  design = design_ato
+)
+
+cox_summary <- summary(cox_uti)
+
+cox_row <- grep(
+  "^TRT2",
+  rownames(cox_summary$coefficients)
+)
+
+POSTUTI_table <- data.frame(
+  Outcome = "POSTUTI",
+  Effect_measure = "HR",
+  Estimate = sprintf(
+    "%.2f",
+    cox_summary$coefficients[
+      cox_row,
+      "exp(coef)"
+    ]
+  ),
+  CI = paste0(
+    sprintf("%.2f",
+            cox_summary$conf.int[cox_row, "lower .95"]),
+    "–",
+    sprintf("%.2f",
+            cox_summary$conf.int[cox_row, "upper .95"])
+  ),
+  P_value = cox_summary$coefficients[
+    cox_row,
+    "Pr(>|z|)"
+  ]
+)
+
+# Combine final results
+final_results <- rbind(
+  gee_table_final,
+  POSTUTI_table
+)
+
+
+# Multiple correction
+
+## Bonferroni correction
+final_results$p_bonferroni <- p.adjust(
+  final_results$P_value,
+  method = "bonferroni"
+)
+
+## Holm-Bonferroni
+final_results$p_holm <- p.adjust(
+  final_results$P_value,
+  method = "holm"
+)
+
+## Benjamini-Hochberg FDR
+final_results$p_FDR <- p.adjust(
+  final_results$P_value,
+  method = "BH"
+)
+
+
+final_results <- final_results %>%
+  mutate(
+    across(
+      c(P_value, p_bonferroni, p_holm, p_FDR),
+      ~case_when(
+        .x < 0.001 ~ "<0.001",
+        TRUE ~ sprintf("%.3f", .x)
+      )
+    )
+  )
+
+final_results
+
+final_results %>%
+  flextable() %>%
+  theme_booktabs() %>%
+  autofit() %>%
+  align(
+    j = c("Estimate", "CI", "P_value"),
+    align = "center",
+    part = "all"
+  ) %>%
+  save_as_docx(
+    path = "output/treatment_unadj_w_norec.docx"
+  )
+
+
+# Evaluate whether CENTER distribution is balanced after weighting, despite that CENTER was not included in weighting
+
+bal.tab(
+   w.out,
+   data = Out,
+   addl = ~ CENTER
+ )
+
+# Results showed that all CENTER SMD < 0.05 → excellent balance
+# Therefore, after ATO weighting, CENTER is well balanced between treatment groups.
+```
+
+
+#### Block 2a - without VUR recurrence
+
+```{r reg2aw_norec, warning=FALSE}
+
+# Block 2: exposure-effect analysis (stent) on postoperative outcomes = Multivariable analyses
+
+outcomes <- c(
+  "LUTD",
+  "OBST",
+  "URCOMPINJ",
+  "SURG",
+  "ILEUS",
+  "GU30",
+  "GU90",
+  "PROC365"
+)
+
+# convert outcomes to numeric
+Out[outcomes] <- lapply(
+  Out[outcomes],
+  function(x) as.numeric(as.character(x))
+)
+
+# Predictors to include in the outcome models
+predictors <- c("TRT2", "STENT")
+
+
+# Apply GEE model after overlap weighting for all binary outcomes
+gee_results <- lapply(outcomes, function(y) {
+  formula <- as.formula(
+    paste(y, "~",
+          paste(predictors, collapse = " + ")
+   )
+  )  
+  model <- geeglm(
+    formula,
+    data = Out,
+    id = CENTER,
+    weights = weights,
+    family = binomial(link = "logit"),
+    corstr = "exchangeable"
+  )
+  tidy(model, exponentiate = TRUE, conf.int = TRUE)   # estimate = OR because exponentiate = TRUE
+})
+names(gee_results) <- outcomes
+
+# Combine results into one table
+gee_table <- do.call(
+  rbind,
+  lapply(names(gee_results), function(x){
+    tmp <- gee_results[[x]]
+    tmp %>%
+      mutate(outcome = x)
+  })
+)
+
+# Create final manuscript table
+gee_table_final <- gee_table %>%
+  mutate(
+    Effect_measure = "OR",
+    Estimate = sprintf("%.2f", estimate),
+    CI = paste0(
+      sprintf("%.2f", conf.low),
+      "–",
+      sprintf("%.2f", conf.high)
+    ),
+    P_value = p.value
+  ) %>%
+  dplyr::select(
+    Outcome = outcome,
+    Predictor = term,
+    Effect_measure,
+    Estimate,
+    CI,
+    P_value
+  )
+
+# weighted Cox model for POSTUTI
+
+cox_uti <- svycoxph(
+  Surv(POSTUTIFUP, POSTUTI == 1) ~ TRT2 + STENT  + strata(CENTER),
+  design = design_ato
+)
+
+cox_summary <- summary(cox_uti)
+
+cox_row <- rownames(cox_summary$coefficients)
+
+POSTUTI_table <- data.frame(
+  Outcome = "POSTUTI",
+  Predictor = rownames(cox_summary$coefficients),
+  Effect_measure = "HR",
+  Estimate = sprintf(
+    "%.2f",
+    cox_summary$coefficients[
+      cox_row,
+      "exp(coef)"
+    ]
+  ),
+  CI = paste0(
+    sprintf("%.2f",
+            cox_summary$conf.int[cox_row, "lower .95"]),
+    "–",
+    sprintf("%.2f",
+            cox_summary$conf.int[cox_row, "upper .95"])
+  ),
+  P_value = cox_summary$coefficients[
+    cox_row,
+    "Pr(>|z|)"
+  ]
+)
+
+
+# Combine final results
+final_results <- rbind(
+  gee_table_final,
+  POSTUTI_table
+)
+
+
+final_results
+
+final_results <- final_results %>%
+  mutate(
+    across(
+      c(P_value),
+      ~case_when(
+        .x < 0.001 ~ "<0.001",
+        TRUE ~ sprintf("%.3f", .x)
+      )
+    )
+  )
+
+
+final_results %>%
+  flextable() %>%
+  theme_booktabs() %>%
+  autofit() %>%
+  align(
+    j = c("Estimate", "CI", "P_value"),
+    align = "center",
+    part = "all"
+  ) %>%
+  save_as_docx(
+    path = "output/treatment_adj_all_wa_norec.docx"
+  )
+
+
+# Multiple correction
+
+# Extract TRT2 rows only
+
+gee_trt2 <- gee_table_final %>%
+  filter(grepl("^TRT2", Predictor))
+
+POSTUTI_trt2 <- POSTUTI_table %>%
+  filter(grepl("^TRT2", Predictor))
+
+# Combine only treatment effects
+treatment_results <- rbind(
+  gee_trt2,
+  POSTUTI_trt2
+)
+
+# Apply Correction
+
+treatment_results$p_bonferroni <- p.adjust(
+  as.numeric(treatment_results$P_value),
+  method = "bonferroni"                             # Bonferroni correction
+)
+
+treatment_results$p_holm <- p.adjust(
+  as.numeric(treatment_results$P_value),
+  method = "holm"                                   # Holm-Bonferroni
+)
+
+treatment_results$p_FDR <- p.adjust(
+  as.numeric(treatment_results$P_value),
+  method = "BH"                                    # Benjamini-Hochberg FDR
+)
+
+
+treatment_results <- treatment_results %>%
+  mutate(
+    across(
+      c(P_value, p_bonferroni, p_holm, p_FDR),
+      ~case_when(
+        .x < 0.001 ~ "<0.001",
+        TRUE ~ sprintf("%.3f", .x)
+      )
+    )
+  )
+
+treatment_results
+
+treatment_results %>%
+  flextable() %>%
+  theme_booktabs() %>%
+  autofit() %>%
+  align(
+    j = c("Estimate", "CI", "P_value"),
+    align = "center",
+    part = "all"
+  ) %>%
+  save_as_docx(
+    path = "output/treatment_adj_wa_norec.docx"
+  )
+
+
+# ADDITIONAL MULTIPLE COMPARISONS
+
+# Extract STENT rows only
+
+gee_st <- gee_table_final %>%
+  filter(grepl("^STENT", Predictor))
+
+POSTUTI_st <- POSTUTI_table %>%
+  filter(grepl("^STENT", Predictor))
+
+# Combine only stent effects
+st_results <- rbind(
+  gee_st,
+  POSTUTI_st
+)
+
+# Apply Correction
+
+st_results$p_bonferroni <- p.adjust(
+  as.numeric(st_results$P_value),
+  method = "bonferroni"                             # Bonferroni correction
+)
+
+st_results$p_holm <- p.adjust(
+  as.numeric(st_results$P_value),
+  method = "holm"                                   # Holm-Bonferroni
+)
+
+st_results$p_FDR <- p.adjust(
+  as.numeric(st_results$P_value),
+  method = "BH"                                    # Benjamini-Hochberg FDR
+)
+
+
+st_results <- st_results %>%
+  mutate(
+    across(
+      c(P_value, p_bonferroni, p_holm, p_FDR),
+      ~case_when(
+        .x < 0.001 ~ "<0.001",
+        TRUE ~ sprintf("%.3f", .x)
+      )
+    )
+  )
+
+st_results
+
+st_results %>%
+  flextable() %>%
+  theme_booktabs() %>%
+  autofit() %>%
+  align(
+    j = c("Estimate", "CI", "P_value"),
+    align = "center",
+    part = "all"
+  ) %>%
+  save_as_docx(
+    path = "output/stent_adj_wa_norec.docx"
+  )
+
+```
+
+#### Block 2ai - without VUR recurrence + with interaction (secondary effect-modification analysis)
+
+```{r reg2aw_noreci}
+
+# Block 2: exposure-effect analysis (stent) on postoperative outcomes with interaction = Multivariable analyses
+
+outcomes <- c(
+  "LUTD",
+  "OBST",
+  "URCOMPINJ",
+  "SURG",
+  "ILEUS",
+  "GU30",
+  "GU90",
+  "PROC365"
+)
+
+# convert outcomes to numeric
+Out[outcomes] <- lapply(
+  Out[outcomes],
+  function(x) as.numeric(as.character(x))
+)
+
+# Predictors to include in the outcome models
+predictors <- "TRT2 * STENT"
+
+
+# Apply GEE model after overlap weighting for all binary outcomes
+gee_results <- lapply(outcomes, function(y) {
+  formula <- as.formula(
+    paste(y, "~",
+          paste(predictors, collapse = " + ")
+   )
+  )  
+  model <- geeglm(
+    formula,
+    data = Out,
+    id = CENTER,
+    weights = weights,
+    family = binomial(link = "logit"),
+    corstr = "exchangeable"
+  )
+  tidy(model, exponentiate = TRUE, conf.int = TRUE)   # estimate = OR because exponentiate = TRUE
+})
+names(gee_results) <- outcomes
+
+# Combine results into one table
+gee_table <- do.call(
+  rbind,
+  lapply(names(gee_results), function(x){
+    tmp <- gee_results[[x]]
+    tmp %>%
+      mutate(outcome = x)
+  })
+)
+
+# Create final manuscript table
+gee_table_final <- gee_table %>%
+  mutate(
+    Effect_measure = "OR",
+    Estimate = sprintf("%.2f", estimate),
+    CI = paste0(
+      sprintf("%.2f", conf.low),
+      "–",
+      sprintf("%.2f", conf.high)
+    ),
+    P_value = p.value
+  ) %>%
+  dplyr::select(
+    Outcome = outcome,
+    Predictor = term,
+    Effect_measure,
+    Estimate,
+    CI,
+    P_value
+  )
+
+
+# weighted Cox model for POSTUTI
+
+cox_uti <- svycoxph(
+  Surv(POSTUTIFUP, POSTUTI == 1) ~ TRT2*STENT  + strata(CENTER),
+  design = design_ato
+)
+
+cox_summary <- summary(cox_uti)
+
+cox_row <- rownames(cox_summary$coefficients)
+
+POSTUTI_table <- data.frame(
+  Outcome = "POSTUTI",
+  Predictor = rownames(cox_summary$coefficients),
+  Effect_measure = "HR",
+  Estimate = sprintf(
+    "%.2f",
+    cox_summary$coefficients[
+      cox_row,
+      "exp(coef)"
+    ]
+  ),
+  CI = paste0(
+    sprintf("%.2f",
+            cox_summary$conf.int[cox_row, "lower .95"]),
+    "–",
+    sprintf("%.2f",
+            cox_summary$conf.int[cox_row, "upper .95"])
+  ),
+  P_value = cox_summary$coefficients[
+    cox_row,
+    "Pr(>|z|)"
+  ]
+)
+
+
+# Combine final results
+final_results <- rbind(
+  gee_table_final,
+  POSTUTI_table
+)
+
+
+final_results
+
+final_results <- final_results %>%
+  mutate(
+    across(
+      c(P_value),
+      ~case_when(
+        .x < 0.001 ~ "<0.001",
+        TRUE ~ sprintf("%.3f", .x)
+      )
+    )
+  )
+
+
+final_results %>%
+  flextable() %>%
+  theme_booktabs() %>%
+  autofit() %>%
+  align(
+    j = c("Estimate", "CI", "P_value"),
+    align = "center",
+    part = "all"
+  ) %>%
+  save_as_docx(
+    path = "output/treatment_adj_all_wa_norec_i.docx"
+  )
+
+
+# Multiple correction
+
+# Extract TRT2 rows only
+
+gee_trt2 <- gee_table_final %>%
+  filter(grepl("^TRT2", Predictor))
+
+POSTUTI_trt2 <- POSTUTI_table %>%
+  filter(grepl("^TRT2", Predictor))
+
+# Combine only treatment effects
+treatment_results <- rbind(
+  gee_trt2,
+  POSTUTI_trt2
+)
+
+# Apply Correction
+
+treatment_results$p_bonferroni <- p.adjust(
+  as.numeric(treatment_results$P_value),
+  method = "bonferroni"                             # Bonferroni correction
+)
+
+treatment_results$p_holm <- p.adjust(
+  as.numeric(treatment_results$P_value),
+  method = "holm"                                   # Holm-Bonferroni
+)
+
+treatment_results$p_FDR <- p.adjust(
+  as.numeric(treatment_results$P_value),
+  method = "BH"                                    # Benjamini-Hochberg FDR
+)
+
+
+treatment_results <- treatment_results %>%
+  mutate(
+    across(
+      c(P_value, p_bonferroni, p_holm, p_FDR),
+      ~case_when(
+        .x < 0.001 ~ "<0.001",
+        TRUE ~ sprintf("%.3f", .x)
+      )
+    )
+  )
+
+treatment_results
+
+treatment_results %>%
+  flextable() %>%
+  theme_booktabs() %>%
+  autofit() %>%
+  align(
+    j = c("Estimate", "CI", "P_value"),
+    align = "center",
+    part = "all"
+  ) %>%
+  save_as_docx(
+    path = "output/treatment_adj_wa_norec_i.docx"
+  )
+
+
+# ADDITIONAL MULTIPLE COMPARISONS
+
+# Extract STENT rows only
+
+gee_st <- gee_table_final %>%
+  filter(grepl("^STENT", Predictor))
+
+POSTUTI_st <- POSTUTI_table %>%
+  filter(grepl("^STENT", Predictor))
+
+# Combine only stent effects
+st_results <- rbind(
+  gee_st,
+  POSTUTI_st
+)
+
+# Apply Correction
+
+st_results$p_bonferroni <- p.adjust(
+  as.numeric(st_results$P_value),
+  method = "bonferroni"                             # Bonferroni correction
+)
+
+st_results$p_holm <- p.adjust(
+  as.numeric(st_results$P_value),
+  method = "holm"                                   # Holm-Bonferroni
+)
+
+st_results$p_FDR <- p.adjust(
+  as.numeric(st_results$P_value),
+  method = "BH"                                    # Benjamini-Hochberg FDR
+)
+
+
+st_results <- st_results %>%
+  mutate(
+    across(
+      c(P_value, p_bonferroni, p_holm, p_FDR),
+      ~case_when(
+        .x < 0.001 ~ "<0.001",
+        TRUE ~ sprintf("%.3f", .x)
+      )
+    )
+  )
+
+st_results
+
+st_results %>%
+  flextable() %>%
+  theme_booktabs() %>%
+  autofit() %>%
+  align(
+    j = c("Estimate", "CI", "P_value"),
+    align = "center",
+    part = "all"
+  ) %>%
+  save_as_docx(
+    path = "output/stent_adj_wa_norec_i.docx"
+  )
+
+```
+
+#### Block 2ai - without VUR recurrence + with interaction (to calculate OR for two levels) (secondary effect-modification analysis)
+
+```{r}
+
+## Manual calculation
+
+outcomes <- c(
+  "LUTD",
+  "OBST",
+  "URCOMPINJ",
+  "SURG",
+  "ILEUS",
+  "GU30",
+  "GU90",
+  "PROC365"
+)
+
+# Convert outcomes to numeric
+Out[outcomes] <- lapply(
+  Out[outcomes],
+  function(x) as.numeric(as.character(x))
+)
+
+
+# Function to extract treatment effects within each stent stratum
+get_gee_interaction_results <- function(y) {
+  
+  formula <- as.formula(
+    paste(y, "~ TRT2 * STENT")
+  )
+  
+  model <- geeglm(
+    formula,
+    data = Out,
+    id = CENTER,
+    weights = weights,
+    family = binomial(link = "logit"),
+    corstr = "exchangeable"
+  )
+  
+  # Coefficients
+  beta <- coef(model)
+  
+  # Robust covariance matrix
+  V <- vcov(model)
+  
+  # -------------------------------------------------------
+  # LG vs Cohen among NO-STENT patients
+  # -------------------------------------------------------
+  
+  b_no_stent <- beta["TRT21"]
+  
+  se_no_stent <- sqrt(
+    V["TRT21", "TRT21"]
+  )
+  
+  OR_no_stent <- exp(b_no_stent)
+  
+  CI_no_stent <- exp(
+    b_no_stent + c(-1, 1) * 1.96 * se_no_stent
+  )
+  
+  # -------------------------------------------------------
+  # LG vs Cohen among STENTED patients
+  # = TRT21 + TRT21:STENT1
+  # -------------------------------------------------------
+  
+  b_stent <- beta["TRT21"] +
+    beta["TRT21:STENT1"]
+  
+  # Variance of the linear combination:
+  # Var(beta1 + beta3)
+  
+  var_stent <-
+    V["TRT21", "TRT21"] +
+    V["TRT21:STENT1", "TRT21:STENT1"] +
+    2 * V["TRT21", "TRT21:STENT1"]
+  
+  se_stent <- sqrt(var_stent)
+  
+  OR_stent <- exp(b_stent)
+  
+  CI_stent <- exp(
+    b_stent + c(-1, 1) * 1.96 * se_stent
+  )
+  
+  # -------------------------------------------------------
+  # Interaction test
+  # -------------------------------------------------------
+  
+  b_interaction <- beta["TRT21:STENT1"]
+  
+  se_interaction <- sqrt(
+    V["TRT21:STENT1", "TRT21:STENT1"]
+  )
+  
+  z_interaction <- b_interaction / se_interaction
+  
+  p_interaction <- 2 * pnorm(
+    abs(z_interaction),
+    lower.tail = FALSE
+  )
+  
+  # -------------------------------------------------------
+  # Return manuscript-ready results
+  # -------------------------------------------------------
+  
+  data.frame(
+    Outcome = y,
+    
+    `LG vs Cohen, No Stent` =
+      sprintf(
+        "%.2f (%.2f–%.2f)",
+        OR_no_stent,
+        CI_no_stent[1],
+        CI_no_stent[2]
+      ),
+    
+    `LG vs Cohen, Stent` =
+      sprintf(
+        "%.2f (%.2f–%.2f)",
+        OR_stent,
+        CI_stent[1],
+        CI_stent[2]
+      ),
+    
+    P_interaction = p_interaction,
+    
+    stringsAsFactors = FALSE
+  )
+}
+
+
+# Run for all 8 outcomes
+interaction_results <- do.call(
+  rbind,
+  lapply(outcomes, get_gee_interaction_results)
+)
+
+
+interaction_results
+
+
+
+# POSTUTI
+
+cox_uti <- svycoxph(
+  Surv(POSTUTIFUP, POSTUTI == 1) ~ TRT2 * STENT +
+    strata(CENTER),
+  design = design_ato
+)
+
+# Coefficients
+beta_cox <- coef(cox_uti)
+
+# Covariance matrix
+V_cox <- vcov(cox_uti)
+
+# -------------------------------------------------------
+# LG vs Cohen among NO-STENT patients
+# -------------------------------------------------------
+
+b_no_stent_cox <- beta_cox["TRT21"]
+
+se_no_stent_cox <- sqrt(
+  V_cox["TRT21", "TRT21"]
+)
+
+HR_no_stent <- exp(b_no_stent_cox)
+
+CI_no_stent_cox <- exp(
+  b_no_stent_cox +
+    c(-1, 1) * 1.96 * se_no_stent_cox
+)
+
+
+# -------------------------------------------------------
+# LG vs Cohen among STENTED patients
+# = TRT21 + TRT21:STENT1
+# -------------------------------------------------------
+
+b_stent_cox <- beta_cox["TRT21"] +
+  beta_cox["TRT21:STENT1"]
+
+var_stent_cox <-
+  V_cox["TRT21", "TRT21"] +
+  V_cox["TRT21:STENT1", "TRT21:STENT1"] +
+  2 * V_cox["TRT21", "TRT21:STENT1"]
+
+se_stent_cox <- sqrt(var_stent_cox)
+
+HR_stent <- exp(b_stent_cox)
+
+CI_stent_cox <- exp(
+  b_stent_cox +
+    c(-1, 1) * 1.96 * se_stent_cox
+)
+
+
+# -------------------------------------------------------
+# Interaction p-value
+# -------------------------------------------------------
+
+b_interaction_cox <- beta_cox["TRT21:STENT1"]
+
+se_interaction_cox <- sqrt(
+  V_cox["TRT21:STENT1", "TRT21:STENT1"]
+)
+
+z_interaction_cox <-
+  b_interaction_cox / se_interaction_cox
+
+p_interaction_cox <- 2 * pnorm(
+  abs(z_interaction_cox),
+  lower.tail = FALSE
+)
+
+
+# Create POSTUTI result
+POSTUTI_interaction <- data.frame(
+  Outcome = "POSTUTI",
+  
+  `LG vs Cohen, No Stent` =
+    sprintf(
+      "%.2f (%.2f–%.2f)",
+      HR_no_stent,
+      CI_no_stent_cox[1],
+      CI_no_stent_cox[2]
+    ),
+  
+  `LG vs Cohen, Stent` =
+    sprintf(
+      "%.2f (%.2f–%.2f)",
+      HR_stent,
+      CI_stent_cox[1],
+      CI_stent_cox[2]
+    ),
+  
+  P_interaction = p_interaction_cox
+)
+
+POSTUTI_interaction
+
+
+```
+
+### 4 PAIN - Non-epidural Cohort
+
+#### 4.1 Filter & weight the new population
+
+```{r filterpain}
+
+# Filter dataset to only those who did not receive EPIDURAL
+Outp <- Out %>%
+  filter(EPIDURAL == "0") %>%
+  mutate(
+    PAIN = factor(
+      PAIN,
+      levels = c("0", "1", "2", "3"),
+      labels = c(
+        "No pain",
+        "Mild pain (score 1-3)",
+        "Moderate pain (score 4-6)",
+        "Severe pain (score 7-10)"
+      ),
+      ordered = TRUE
+    )
+  )
+
+# Do weighting: using ATO (Recommended)
+
+set.seed(123)
+
+w.outp <- weightit(
+  TRT2 ~ AGS + YEARS + GENDER + BMI + PREOPRNPLN + HISTOINJ +
+    SURGIND2 + PREOPVURGRADE + VURSIDE + UDR7M + VURPHASE +
+    PREOPEPISODE1 + PREOPTYPEU1 + PREOPRNSCR + SURGTECH2,
+  data = Outp,
+  method = "ps",
+  estimand = "ATO", 
+  stabilize = FALSE  # used in ATE
+)
+Outp$weights <- w.outp$weights  # Add weights to the dataset
+write.csv(Outp, "data/weighted_nonepidural_data.csv", row.names = FALSE)
+
+summary(w.outp$weights)
+
+
+# Table for balance
+
+balp <- cobalt::bal.tab(w.outp, un = TRUE, ESS = TRUE, m.threshold = 0.1)  
+balp 
+
+balp_df <- as.data.frame(balp$Balance)
+smd_table <- balp_df %>%
+  mutate(
+    Variable = rownames(balp_df),
+    SMD_Before = round(abs(Diff.Un), 3),
+    SMD_After  = round(abs(Diff.Adj), 3)
+  ) %>%
+  dplyr::select(Variable, SMD_Before, SMD_After)
+
+smd_table %>%
+  flextable() %>%
+  save_as_docx(path = "output/SMD_pw.docx")
+
+
+# Figure for balance - Love plot
+plp <- love.plot(
+  w.outp,
+  threshold = 0.1,
+  abs = TRUE, 
+  stats = "mean.diffs",      
+  var.order = "unadjusted", 
+  drop.distance = TRUE, 
+  sample.names = c("Before Overlap Weighting", "After Overlap Weighting"),
+    var.names = c(
+    AGS = "Age at surgery",
+    YEARS = "Year of surgery",
+    BMI = "Body mass index",
+    GENDER = "Female gender",
+    PREOPRNPLN = "Preop pyelonephritis",
+    HISTOINJ = "History of injection",
+    VURSIDE = "Right-sided VUR",
+    UDR7M = "Ureteral dilation ≥ 7mm",
+    PREOPTYPEU1 = "Preop febrile UTIs",
+    PREOPRNSCR = "Preop renal scarring",
+    VURPHASE_1 = "Reflux: voiding phase",
+    VURPHASE_2 = "Reflux: filling phase",
+    VURPHASE_3 = "Reflux: filling + voiding",
+    SURGTECH2_1 = "Surgeon experience ≥100 operations",
+    SURGTECH2_2 = "Surgeon experience 50-100 operations",
+    SURGTECH2_3 = "Surgeon experience <50 operations",
+    PREOPEPISODE1_1 = "Preop UTI episodes: 1",
+    PREOPEPISODE1_2 = "Preop UTI episodes: 2",
+    PREOPEPISODE1_3 = "Preop UTI episodes: ≥3",
+    SURGIND2_1 = "Indication: breakthrough UTI",
+    SURGIND2_2 = "Indication: high-grade reflux (III-V)",
+    SURGIND2_3 = "Indication: poor compliance to medical treatment",
+    SURGIND2_4 = "Indication: ineffective/poorly tolerated CAP",
+    SURGIND2_5 = "Indication: other",
+    PREOPVURGRADE_3 = "Preop VUR grade: III",
+    PREOPVURGRADE_4 = "Preop VUR grade: IV",
+    PREOPVURGRADE_5 = "Preop VUR grade: V"
+  )
+  )
+
+plp <- plp +
+    labs(
+    x = "Absolute Standardized Differences",
+    subtitle = "Overlap population of children who did not receive epidural analgesia"
+  )
+    theme(
+      plot.margin = margin(10, 10, 10, 10),
+      axis.text = element_text(size = 16),
+      axis.title = element_text(size = 16),
+      plot.title = element_text(size = 16),
+      legend.text = element_text(size = 16),
+      legend.title = element_text(size = 16),
+      axis.ticks = element_line(size = 0.5, color = "black"),
+      axis.line = element_line(size = 0.5, color = "black"),
+      panel.background = element_blank(), 
+      panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank(),
+      panel.border = element_blank(),
+      axis.ticks.length = unit(0.3, "cm"),
+      panel.spacing = unit(2, "lines")
+   )
+
+ggsave ("figures/love_plot_pw.png", plot = plp, width = 12, height = 10, dpi = 300)
+
+# Compute mean SMD
+smdp_df <- balp$Balance
+mean_smdp_before <- mean(abs(smdp_df$Diff.Un), na.rm = TRUE) # calculate mean SMD before matching
+mean_smdp_after <- mean(abs(smdp_df$Diff.Adj), na.rm = TRUE) # calculate mean SMD before matching
+mean_smdp <- data.frame(
+  Mean_SMDp_Before = mean_smdp_before,
+  Mean_SMDp_After = mean_smdp_after
+)
+
+mean_smdp
+
+# how much effective sample size remains (overall ESS: calculated manually)?
+summary(w.outp$weights)
+bal.tab(w.outp)$Effective.Sample.Size
+sum(w.outp$weights)^2 / sum(w.outp$weights^2)
+
+
+# propensity score distribution
+summary(w.outp$ps)
+pl2p <-plot(summary(w.outp, type = "hist"))
+ggsave ("figures/propensity_pw.png", plot = pl2p, width = 12, height = 10, dpi = 300)
+
+
+# Distribution of overlap weights: histogram and density
+
+## Histogram
+summary(w.outp$weights)
+png("figures/weights_histo_pw.png",
+    width = 6,
+    height = 4,
+    units = "in",
+    res = 300)
+
+hist(
+  w.outp$weights,
+  breaks = 30,
+  col = "lightblue",
+  border = "black",
+  main = "Distribution of Overlap Weights",
+  xlab = "Overlap Weight"
+)
+dev.off()
+
+
+# Distributional balance for propensity score (purpose: to evaluate overlap/positivity):
+
+# Before-After weighting
+p_ps_pain <- bal.plot(
+  w.outp,
+  var.name = "prop.score",
+  type = "density",
+  which = "both"
+) 
+
+p_ps_pain <- p_ps_pain +
+  scale_color_viridis_d(
+    option = "mako",
+    begin = 0.3,
+    end = 0.8,
+    labels = c("Cohen group", "Lich–Gregoir group")
+  ) +
+  scale_fill_viridis_d(
+    option = "mako",
+    begin = 0.3,
+    end = 0.8,
+    labels = c("Cohen group", "Lich–Gregoir group")
+  )
+
+ggsave(
+  "figures/PS_density_before_after_pATO.png",
+  p_ps_pain,
+  width = 10,
+  height = 7,
+  dpi = 300
+)
+
+```
+ 
+#### 4.2 Descriptive analysis
+
+```{r painw}
+
+# Baseline characteristics in the population for pain
+table1p<- Outp %>%
+  dplyr::select(YEARS, AGS, GENDER, BMI, HISTOINJ, SURGIND2, PREOPVURGRADE, VURSIDE, UDR7M, 
+         VURPHASE, PREOPTYPEU1, PREOPEPISODE1, PREOPRNPLN, PREOPRNSCR,
+         SURGTECH2, CENTER, TRT2
+  ) %>%
+  tbl_summary(
+    by = TRT2,  # for stratification
+    statistic = list(
+      all_continuous() ~ "{median} ({p25}-{p75})",
+      all_categorical() ~ "{n} ({p}%)" 
+    ),
+    digits = all_categorical() ~ c(0, 1),  # n = 0 decimals, p = 1 decimal
+    missing = "ifany",  # shows missing only when present
+    missing_text = "Missing"
+  ) %>%
+  add_overall() %>%
+  add_p(pvalue_fun = ~style_pvalue(.x, digits = 3)) %>%  #  3 decimals 
+  bold_labels()
+
+table1p
+
+table1p %>%
+  as_flex_table() %>%
+  flextable::save_as_docx(path = "output/baseline_p.docx")
+
+
+# Create survey design object using overlap weights
+design_pato <- svydesign(
+  ids = ~1, 
+  data = Outp,
+  weights = ~weights
+)
+
+# Weighted baseline characteristics
+table1pw <- design_pato %>%
+  tbl_svysummary(
+    by = TRT2,    # for stratification
+    include = c(
+      YEARS, AGS, GENDER, BMI, HISTOINJ, SURGIND2, PREOPVURGRADE, VURSIDE, UDR7M, 
+         VURPHASE, PREOPTYPEU1, PREOPEPISODE1, PREOPRNPLN, PREOPRNSCR,
+         SURGTECH2, CENTER    # generally we should not include TRT2 in include list
+  ),
+    statistic = list(
+      all_continuous() ~ "{median} ({p25}-{p75})",
+      all_categorical() ~ "{n} ({p}%)"
+    ),
+    digits = all_categorical() ~ c(0, 1),
+    missing = "ifany",  # shows missing only when present
+    missing_text = "Missing"
+  ) %>%
+  add_overall() %>%
+  bold_labels()
+
+table1pw
+
+table1pw %>%
+  as_flex_table() %>%
+  flextable::save_as_docx(
+    path = "output/baseline_pw.docx"
+  )
+
+
+# Weighted procedural factors
+table2p<- design_pato %>%
+  tbl_svysummary(
+    by = TRT2,  # for stratification
+    include = c (
+      OPRTIME, STENT, CATH, CATHPERIOD, CATHPERIOD_G, HOSPTIME
+    ),
+    statistic = list(
+      all_continuous() ~ "{median} ({p25}-{p75})", # or ~ "{mean} ± {sd}",
+      all_categorical() ~ "{n} ({p}%)" 
+    ),
+    digits = all_categorical() ~ c(0, 1),  # n = 0 decimals, p = 1 decimal
+    missing = "ifany",
+    missing_text = "Missing"
+  ) %>%
+  add_overall() %>%
+  add_p(pvalue_fun = ~style_pvalue(.x, digits = 3)) %>%  #  3 decimals 
+  bold_labels()
+
+table2p
+
+table2p %>%
+  as_flex_table() %>%
+  flextable::save_as_docx(path = "output/procedural_pw.docx")
+
+# Weighted pain
+
+# Before weighting
+
+table4 <- Outp %>%
+  dplyr::select(PAIN, NARC, NONARC, Treatment) %>%
+  tbl_summary(
+    by = Treatment,
+    statistic = list(
+      all_categorical() ~ "{n} ({p}%)"
+    ),
+    label = list(
+      PAIN ~ "Pain score",
+      NARC ~ "Narcotic use",
+      NONARC ~ "Non-narcotic use"
+    ),
+    digits = all_categorical() ~ c(0, 1),
+    missing = "ifany",
+    missing_text = "Missing"
+  ) %>%
+  add_overall() %>%
+  add_p(pvalue_fun = ~style_pvalue(.x, digits = 3)) %>%
+  bold_labels()
+
+
+# After ATO weighting 
+
+design_atop <- svydesign(
+  ids = ~1,
+  data = Outp,
+  weights = ~weights
+)
+
+# Weighted pain characteristics
+table4w <- design_atop %>%
+  tbl_svysummary(
+    by = Treatment,    # for stratification
+    include = c(
+      PAIN, NARC, NONARC
+  ),
+    statistic = list(
+      all_categorical() ~ "{n} ({p}%)"
+    ),
+    label = list(
+      PAIN ~ "Pain score",
+      NARC ~ "Narcotic use",
+      NONARC ~ "Non-narcotic use"
+    ),
+    digits = all_categorical() ~ c(0, 1),
+    missing = "ifany",  # shows missing only when present
+    missing_text = "Missing"
+  ) %>%
+  add_overall() %>%
+  add_p(pvalue_fun = ~style_pvalue(.x, digits = 3)) %>% 
+  bold_labels()
+
+
+# MERGE TABLES
+table_combined <- tbl_merge(
+  tbls = list(table4, table4w),
+  tab_spanner = c("**Before overlap weighting**", "**After overlap weighting**")
+) %>%
+  modify_caption(
+    "Table 4. Comparison of pain intensity and analgesic use between treatment groups before and after propensity score overlap weighting."
+) %>%
+  modify_source_note(
+    "Analysis restricted to patients not receiving epidural analgesia."
+  )
+
+table_combined
+
+table_combined %>%
+  as_flex_table() %>%
+  flextable::save_as_docx(path = "output/pain_w.docx")
+
+```
+
+#### 4.3 Plot:  BEFORE-AFTER weighting
+
+```{r painplotw}
+
+# label datasets
+before <- Outp %>%
+  mutate(
+        plot_weight = 1,
+        Status = "Before overlap weighting (N=383), p<0.001"
+        )
+
+after <- Outp %>%
+  mutate(
+    plot_weight = weights,
+    Status = "After overlap weighting (ESS=219), p<0.001")
+
+# Combine
+plot_data <- bind_rows(before, after)
+
+# pain labels
+plot_data <- plot_data %>%
+  mutate(
+    PAIN_plot = factor(
+      PAIN,
+      levels = levels(PAIN),
+      labels = c("No pain", "Mild pain", "Moderate pain", "Severe pain")
+    )
+  )
+
+# To define order of data
+plot_data <- plot_data %>%
+  mutate(
+    Status = factor(
+      Status,
+      levels = c(
+        "Before overlap weighting (N=383), p<0.001",
+        "After overlap weighting (ESS=219), p<0.001"
+      )
+    )
+  )
+
+
+# 100% stacked grouped bar plot
+
+# summary
+plot_summary1 <- plot_data %>%
+  group_by(Status, Treatment, PAIN) %>%
+  summarise(
+    weighted_n = sum(plot_weight, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  group_by(Status, Treatment) %>%
+  mutate(
+    Percent = 100 * weighted_n / sum(weighted_n)
+  )
+
+s1 <- ggplot(plot_summary1,
+            aes(x = Treatment, y = Percent, fill = PAIN)) +
+  geom_bar(stat = "identity", position = "fill", width = 0.7) +
+  facet_wrap(~Status) +
+  labs(
+    x = "
+    Treatment groups",
+    y = "Percentage of patients not receiving epidural analgesia (%)",
+    fill = "1-Day postoperative pain score"
+  ) +
+  scale_fill_manual(values = c(
+  "No pain" = "#f5f5f5",  # Intead of pure white "#ffffff"
+  "Mild pain (score 1-3)" = "#fee8c8",
+  "Moderate pain (score 4-6)" = "#fdbb84",
+  "Severe pain (score 7-10)" = "#e34a33"
+  )) +
+  scale_y_continuous(labels = scales::percent_format(scale = 100)) +
+  theme_minimal() +
+  theme(
+    panel.grid = element_blank(),
+    axis.title = element_text(size = 12),
+    axis.text = element_text(size = 11),
+    panel.border = element_rect(color = "black", fill = NA),
+    strip.text = element_text(face = "bold"),
+    panel.spacing = unit(0, "lines")
+  )
+
+ggsave(
+  filename = "figures/pain_stacked_w.png",
+  plot = s1,
+  width = 9,
+  height = 6,
+  dpi = 300
+)
+
+```
+
+
+#### 4.4 Regression
+
+```{r regpain}
+
+# -----------------------------------------
+### Moderate-severe pain vs. Other levels
+# -----------------------------------------
+
+Outp <- Outp %>%
+  mutate(
+    PAIN_ms = factor(
+      ifelse(
+        PAIN %in% c(
+          "Moderate pain (score 4-6)",
+          "Severe pain (score 7-10)"
+        ),
+        1,
+        0
+      ),
+      levels = c(0, 1),
+      labels = c(
+        "No/Mild pain (score 0-3)",
+        "Moderate-Severe pain (score 4-10)"
+      )
+    )
+  )
+
+
+Outp$PAIN_ms <- ifelse(
+  Outp$PAIN_ms == "Moderate-Severe pain (score 4-10)",
+  1,
+  0
+)
+
+# -----------------------------------------------------
+### Exploratory analysis: Severe pain vs. Other levels
+# -----------------------------------------------------
+
+Outp <- Outp %>%
+  mutate(
+    PAIN_s = factor(
+      ifelse(
+        PAIN == "Severe pain (score 7-10)",
+        1,
+        0
+      ),
+      levels = c(0, 1),
+      labels = c(
+        "No severe pain (score 0-6)",
+        "Severe pain (score 7-10)"
+      )
+    )
+  )
+
+# a numeric binary outcome:
+Outp$PAIN_s <- ifelse(
+  Outp$PAIN_s == "Severe pain (score 7-10)",
+  1,
+  0
+)
+
+#----------
+# Block 1
+#----------
+
+outcomes <- c(
+  "PAIN_ms",
+  "PAIN_s"
+)
+
+# convert outcomes to numeric
+Outp[outcomes] <- lapply(
+  Outp[outcomes],
+  function(x) as.numeric(as.character(x))
+)
+
+# Apply GEE model after overlap weighting for all binary outcomes
+gee_results <- lapply(outcomes, function(y) {
+  formula <- as.formula(
+    paste(y, "~ TRT2")
+  )
+  model <- geeglm(
+    formula,
+    data = Outp,
+    id = CENTER,
+    weights = weights,
+    family = binomial(link = "logit"),
+    corstr = "exchangeable"
+  )
+  tidy(model, exponentiate = TRUE, conf.int = TRUE)   # estimate = OR because exponentiate = TRUE
+})
+names(gee_results) <- outcomes
+
+
+# Combine results into one table
+gee_table <- do.call(
+  rbind,
+  lapply(names(gee_results), function(x){
+    tmp <- gee_results[[x]]
+    tmp <- tmp %>%
+      filter(grepl("^TRT2", term)) %>%
+      mutate(outcome = x)
+    tmp
+  })
+)
+
+# Create final manuscript table
+gee_table_final <- gee_table %>%
+  mutate(
+    Effect_measure = "OR",
+    Estimate = sprintf("%.2f", estimate),
+    CI = paste0(
+      sprintf("%.2f", conf.low),
+      "–",
+      sprintf("%.2f", conf.high)
+    ),
+    P_value = ifelse(p.value < 0.001, "<0.001", sprintf("%.3f", p.value))
+  ) %>%
+  dplyr::select(
+    Outcome = outcome,
+    Effect_measure,
+    Estimate,
+    CI,
+    P_value
+  )
+
+gee_table_final
+
+gee_table_final %>%
+  flextable() %>%
+  theme_booktabs() %>%
+  autofit() %>%
+  align(
+    j = c("Estimate", "CI", "P_value"),
+    align = "center",
+    part = "all"
+  ) %>%
+  save_as_docx(
+    path = "output/pain_unadj_w.docx"
+  )
+
+
+#--------
+# Block 2
+#---------
+
+outcomes <- c(
+  "PAIN_ms",
+  "PAIN_s"
+)
+
+
+# convert outcomes to numeric
+Outp[outcomes] <- lapply(
+  Outp[outcomes],
+  function(x) as.numeric(as.character(x))
+)
+
+# Predictors to include in the outcome models
+predictors <- c("TRT2", "STENT")
+
+
+# Apply GEE model after overlap weighting for all binary outcomes
+gee_results <- lapply(outcomes, function(y) {
+  formula <- as.formula(
+    paste(y, "~",
+          paste(predictors, collapse = " + ")
+   )
+  )  
+  model <- geeglm(
+    formula,
+    data = Outp,
+    id = CENTER,
+    weights = weights,
+    family = binomial(link = "logit"),
+    corstr = "exchangeable"
+  )
+  tidy(model, exponentiate = TRUE, conf.int = TRUE)   # estimate = OR because exponentiate = TRUE
+})
+names(gee_results) <- outcomes
+
+# Combine results into one table
+gee_table <- do.call(
+  rbind,
+  lapply(names(gee_results), function(x){
+    tmp <- gee_results[[x]]
+    tmp %>%
+      mutate(outcome = x)
+  })
+)
+
+# Create final manuscript table
+gee_table_final <- gee_table %>%
+  mutate(
+    Effect_measure = "OR",
+    Estimate = sprintf("%.2f", estimate),
+    CI = paste0(
+      sprintf("%.2f", conf.low),
+      "–",
+      sprintf("%.2f", conf.high)
+    ),
+    P_value = ifelse(p.value < 0.001, "<0.001", sprintf("%.3f", p.value))
+  ) %>%
+  dplyr::select(
+    Outcome = outcome,
+    Predictor = term,
+    Effect_measure,
+    Estimate,
+    CI,
+    P_value
+  )
+
+gee_table_final
+
+gee_table_final %>%
+  flextable() %>%
+  theme_booktabs() %>%
+  autofit() %>%
+  align(
+    j = c("Estimate", "CI", "P_value"),
+    align = "center",
+    part = "all"
+  ) %>%
+  save_as_docx(
+    path = "output/pain_adj_w.docx"
+  )
+
+
+
+#------------------------
+# Block 2ai- Interaction
+#------------------------
+
+outcomes <- c(
+  "PAIN_ms",
+  "PAIN_s"
+)
+
+
+# convert outcomes to numeric
+Outp[outcomes] <- lapply(
+  Outp[outcomes],
+  function(x) as.numeric(as.character(x))
+)
+
+# Function to extract treatment effects within each stent stratum
+get_gee_interaction_results <- function(y) {
+  
+  formula <- as.formula(
+    paste(y, "~ TRT2 * STENT")
+  )
+  
+  model <- geeglm(
+    formula,
+    data = Outp,
+    id = CENTER,
+    weights = weights,
+    family = binomial(link = "logit"),
+    corstr = "exchangeable"
+  )
+  
+  # Coefficients
+  beta <- coef(model)
+  
+  # Robust covariance matrix
+  V <- vcov(model)
+  
+  # -------------------------------------------------------
+  # LG vs Cohen among NO-STENT patients
+  # -------------------------------------------------------
+  
+  b_no_stent <- beta["TRT21"]
+  
+  se_no_stent <- sqrt(
+    V["TRT21", "TRT21"]
+  )
+  
+  OR_no_stent <- exp(b_no_stent)
+  
+  CI_no_stent <- exp(
+    b_no_stent + c(-1, 1) * 1.96 * se_no_stent
+  )
+  
+  # -------------------------------------------------------
+  # LG vs Cohen among STENTED patients
+  # = TRT21 + TRT21:STENT1
+  # -------------------------------------------------------
+  
+  b_stent <- beta["TRT21"] +
+    beta["TRT21:STENT1"]
+  
+  # Variance of the linear combination:
+  # Var(beta1 + beta3)
+  
+  var_stent <-
+    V["TRT21", "TRT21"] +
+    V["TRT21:STENT1", "TRT21:STENT1"] +
+    2 * V["TRT21", "TRT21:STENT1"]
+  
+  se_stent <- sqrt(var_stent)
+  
+  OR_stent <- exp(b_stent)
+  
+  CI_stent <- exp(
+    b_stent + c(-1, 1) * 1.96 * se_stent
+  )
+  
+  # -------------------------------------------------------
+  # Interaction test
+  # -------------------------------------------------------
+  
+  b_interaction <- beta["TRT21:STENT1"]
+  
+  se_interaction <- sqrt(
+    V["TRT21:STENT1", "TRT21:STENT1"]
+  )
+  
+  z_interaction <- b_interaction / se_interaction
+  
+  p_interaction <- 2 * pnorm(
+    abs(z_interaction),
+    lower.tail = FALSE
+  )
+  
+  # -------------------------------------------------------
+  # Return manuscript-ready results
+  # -------------------------------------------------------
+  
+  data.frame(
+    Outcome = y,
+    
+    `LG vs Cohen, No Stent` =
+      sprintf(
+        "%.2f (%.2f–%.2f)",
+        OR_no_stent,
+        CI_no_stent[1],
+        CI_no_stent[2]
+      ),
+    
+    `LG vs Cohen, Stent` =
+      sprintf(
+        "%.2f (%.2f–%.2f)",
+        OR_stent,
+        CI_stent[1],
+        CI_stent[2]
+      ),
+    
+    P_interaction = p_interaction,
+    
+    stringsAsFactors = FALSE
+  )
+}
+
+
+# Run for all 8 outcomes
+interaction_results <- do.call(
+  rbind,
+  lapply(outcomes, get_gee_interaction_results)
+)
+
+
+interaction_results
+```
+
+
+# SENSITIVITY ANALYSIS 1
+
+### 1 E-value for outcomes
+
+```{r evalue}
+
+# E-value explains away a specific treatment–outcome association.
+
+evalue_data <- data.frame(
+  Outcome = c(
+    "OBST",
+    "URCOMPINJ",
+    "SURG",
+    "ILEUS",
+    "GU90",
+    "OBSTadj",
+    "URCOMPINJadj",
+    "SURGadj",
+    "ILEUSadj",
+    "GU90adj",
+    "GU30adj",    
+    "PROC365adj",
+    "PAIN_ms",
+    "PAIN_s",    
+    "PAIN_msadj", 
+    "PAIN_sadj"     
+  ),
+  OR = c(
+    3.67,
+    0.43,
+    0.72,
+    0.10,
+    0.20,
+    3.71,
+    0.36,
+    0.63,
+    0.20,
+    0.18,
+    0.03,
+    0.71,
+    0.32,
+    0.20,
+    0.32,
+    0.14
+  ),
+  CI_low = c(
+    2.21,
+    0.27,
+    0.58,
+    0.04,
+    0.16,
+    2.50,
+    0.27,
+    0.50,
+    0.17,
+    0.15,
+    0.01,
+    0.56,
+    0.14,
+    0.15,
+    0.15,
+    0.10
+  ),
+  CI_high = c(
+    6.10,
+    0.69,
+    0.90,
+    0.25,
+    0.26,
+    5.52,
+    0.49,
+    0.81,
+    0.24,
+    0.21,
+    0.08,
+    0.89,
+    0.73,
+    0.26,
+    0.69,
+    0.19
+  )
+)
+
+
+# Specify rare outcome assumption
+evalue_data <- evalue_data %>%
+  mutate(
+    rare = ifelse(
+      Outcome %in% c("SURG", "GU90", "SURGadj", "GU90adj", "GU30adj", "Pain_ms", "Pain_s", "Pain_msadj", "Pain_sadj"),
+      FALSE,
+      TRUE
+    )
+  )
+
+
+# Calculate E-values
+evalue_results <- evalue_data %>%
+  rowwise() %>%
+  mutate(
+    OR_input = ifelse(OR < 1, 1/OR, OR),
+    CI_low_input = ifelse(OR < 1, 1/CI_high, CI_low),
+    CI_high_input = ifelse(OR < 1, 1/CI_low, CI_high),
+    
+    E_value = list(
+      evalues.OR(
+        est = OR_input,
+        lo = CI_low_input,
+        hi = CI_high_input,
+        rare = rare
+      )
+    )
+  ) %>%
+  ungroup()
+
+evalue_table <- evalue_results %>%
+  mutate(
+    E_value_point = sapply(
+      E_value,
+      function(x) x["E-values", "point"]
+    ),
+    E_value_CI = sapply(
+      E_value,
+      function(x) x["E-values", "lower"]
+    )
+  ) %>%
+  dplyr::select(
+    Outcome,
+    OR,
+    CI_low,
+    CI_high,
+    E_value_point,
+    E_value_CI
+  )
+
+evalue_table
+
+
+evalue_table_formatted <- evalue_table %>%
+  mutate(
+    OR = sprintf("%.2f", OR),
+    CI = paste0(
+      sprintf("%.2f", CI_low),
+      "–",
+      sprintf("%.2f", CI_high)
+    ),
+    E_value_point = sprintf("%.2f", E_value_point),
+    E_value_CI = sprintf("%.2f", E_value_CI)
+  ) %>%
+  dplyr::select(
+    Outcome,
+    OR,
+    CI,
+    E_value_point,
+    E_value_CI
+  )
+
+evalue_table_formatted %>%
+  flextable() %>%
+  theme_booktabs() %>%
+  autofit() %>%
+  align(
+    j = c("OR", "CI", "E_value_point", "E_value_CI"),
+    align = "center",
+    part = "all"
+  ) %>%
+  save_as_docx(
+    path = "output/E_value_stent.docx"
+  )
+
+```
+
+#### 1.1. Plot E-value
+
+```{r evalueplot}
+
+# E-value sensitivity contour plot for Obstruction risk in overlap weighting before adjustment to procedural factors
+
+
+# OBST values
+RR_est <- 3.67
+RR_CI  <- 2.21
+
+E_value_point <- RR_est + sqrt(RR_est*(RR_est-1))
+E_value_CI <- RR_CI + sqrt(RR_CI*(RR_CI-1))
+
+# Function for contour
+evalue_curve <- function(RR){
+
+  x <- seq(RR + 0.001, 20, length.out = 5000)
+
+  y <- RR * (x - 1)/(x - RR)
+
+  data.frame(
+    RR_EU = x,
+    RR_UY = y
+  )
+}
+
+curve_est <- evalue_curve(RR_est)
+curve_CI  <- evalue_curve(RR_CI)
+
+
+# Create plot
+evalue_plot <- ggplot() +
+
+  # Point estimate curve
+  geom_line(
+    data = curve_est,
+    aes(
+      x = RR_EU,
+      y = RR_UY
+    ),
+    color = "red",
+    linewidth = 0.8
+  ) +
+
+  # CI curve
+  geom_line(
+    data = curve_CI,
+    aes(
+      x = RR_EU,
+      y = RR_UY
+    ),
+    color = "blue",
+    linewidth = 0.8
+  ) +
+
+  # E-value point
+  geom_point(
+    aes(
+      x = E_value_point,
+      y = E_value_point
+    ),
+    color = "red",
+    size = 2.5
+  ) +
+
+  # CI E-value point
+  geom_point(
+    aes(
+      x = E_value_CI,
+      y = E_value_CI
+    ),
+    color = "blue",
+    size = 2.5
+  ) +
+
+  # Labels
+  annotate(
+    "text",
+    x = E_value_point,
+    y = E_value_point + 0.35,
+    label = paste0(
+      "E value: (",
+      round(E_value_point,2),
+      ", ",
+      round(E_value_point,2),
+      ")"
+    ),
+    color = "black",
+    size = 4,
+    hjust = 0
+  ) +
+
+  annotate(
+    "text",
+    x = E_value_CI,
+    y = E_value_CI - 0.25,
+    label = paste0(
+      "E value (CI): (",
+      round(E_value_CI,2),
+      ", ",
+      round(E_value_CI,2),
+      ")"
+    ),
+    color = "black",
+    size = 4,
+    hjust = 0
+  ) +
+
+  scale_x_continuous(
+    limits = c(1,20),
+    breaks = seq(5,20,5)
+  ) +
+
+  scale_y_continuous(
+    limits = c(1,20),
+    breaks = seq(0,20,5)
+  ) +
+
+  labs(
+    x = "Risk ratio for exposure-confounder relationship",
+    y = "Risk ratio for confounder-outcome relationship"
+  ) +
+
+  theme_gray(base_size = 14)
+
+
+
+# OBST values
+RR_est_a <- 3.71
+RR_CI_a  <- 2.50
+
+E_value_point_a <- RR_est_a + sqrt(RR_est_a*(RR_est_a-1))
+E_value_CI_a <- RR_CI_a + sqrt(RR_CI_a*(RR_CI_a-1))
+
+
+# Function for contour
+evalue_curve <- function(RR){
+
+  x <- seq(RR + 0.001, 20, length.out = 5000)
+
+  y <- RR * (x - 1)/(x - RR)
+
+  data.frame(
+    RR_EU = x,
+    RR_UY = y
+  )
+}
+
+curve_est_a <- evalue_curve(RR_est_a)
+curve_CI_a  <- evalue_curve(RR_CI_a)
+
+
+# Create plot
+evalue_plot_a <- ggplot() +
+
+  # Point estimate curve
+  geom_line(
+    data = curve_est_a,
+    aes(
+      x = RR_EU,
+      y = RR_UY
+    ),
+    color = "red",
+    linewidth = 0.8
+  ) +
+
+  # CI curve
+  geom_line(
+    data = curve_CI_a,
+    aes(
+      x = RR_EU,
+      y = RR_UY
+    ),
+    color = "blue",
+    linewidth = 0.8
+  ) +
+
+  # E-value point
+  geom_point(
+    aes(
+      x = E_value_point_a,
+      y = E_value_point_a
+    ),
+    color = "red",
+    size = 2.5
+  ) +
+
+  # CI E-value point
+  geom_point(
+    aes(
+      x = E_value_CI_a,
+      y = E_value_CI_a
+    ),
+    color = "blue",
+    size = 2.5
+  ) +
+
+  # Labels
+  annotate(
+    "text",
+    x = E_value_point_a,
+    y = E_value_point_a + 0.35,
+    label = paste0(
+      "E value: (",
+      round(E_value_point_a,2),
+      ", ",
+      round(E_value_point_a,2),
+      ")"
+    ),
+    color = "black",
+    size = 4,
+    hjust = 0
+  ) +
+
+  annotate(
+    "text",
+    x = E_value_CI_a,
+    y = E_value_CI_a - 0.25,
+    label = paste0(
+      "E value (CI): (",
+      round(E_value_CI_a,2),
+      ", ",
+      round(E_value_CI_a,2),
+      ")"
+    ),
+    color = "black",
+    size = 4,
+    hjust = 0
+  ) +
+
+  scale_x_continuous(
+    limits = c(1,20),
+    breaks = seq(5,20,5)
+  ) +
+
+  scale_y_continuous(
+    limits = c(1,20),
+    breaks = seq(0,20,5)
+  ) +
+
+  labs(
+    x = "Risk ratio for exposure-confounder relationship",
+    y = "Risk ratio for confounder-outcome relationship"
+  ) +
+
+  theme_gray(base_size = 14)
+
+
+#------------------------------------------------------------
+# Combine plot and risk table using patchwork
+#------------------------------------------------------------
+combined_plot <- (evalue_plot | evalue_plot_a) +
+  plot_annotation(
+    tag_levels = "A"
+  )
+
+
+#------------------------------------------------------------
+# Save the figure
+#------------------------------------------------------------
+ggsave(
+  filename = "figures/Evalue_OBST.png",
+  plot = combined_plot,
+  width = 20,
+  height = 10,
+  dpi = 300
+)
+
+
+```
+
+
+# SENSITIVITY ANALYSIS 2
+
+### 1 Do matching 1:1 without replacement
+
+```{r matching, warning=FALSE}
+
+# Fit matching model using propensity score (calculated inside MatchIt): 1:1 matching
+
+set.seed(123) 
+ 
+m.out <- matchit(
+  TRT2 ~ AGS + YEARS + GENDER + BMI + PREOPRNPLN + HISTOINJ +
+    SURGIND2 + PREOPVURGRADE + VURSIDE + UDR7M + VURPHASE +
+    PREOPEPISODE1 + PREOPTYPEU1 + PREOPRNSCR + SURGTECH2,
+  data = Out,
+  method = "nearest",
+  ratio = 1,  # 1:1 matching (1 treated : 1 control)
+  distance = "logit",
+   caliper = 0.2
+) 
+
+
+mdata <- match.data(
+  m.out,
+  weights = "weights_psm"
+)
+
+readr::write_csv(mdata, "data/matched_data.csv")  
+
+
+# Table for balance
+balm <- cobalt::bal.tab(m.out, un = TRUE, m.threshold = 0.1)  
+balm 
+
+bal_dfm <- as.data.frame(balm$Balance)
+smd_tablem <- bal_dfm %>%
+  mutate(
+    Variable = rownames(bal_dfm),
+    SMD_Before = round(abs(Diff.Un), 3),
+    SMD_After  = round(abs(Diff.Adj), 3)
+  ) %>%
+  select(Variable, SMD_Before, SMD_After)
+
+smd_tablem %>%
+  flextable() %>%
+  save_as_docx(path = "output/SMD_psm.docx")
+
+
+# how much effective sample size remains (overall ESS: calculated manually)?
+summary(m.out$weights)
+bal.tab(m.out)$Effective.Sample.Size
+sum(m.out$weights)^2 / sum(m.out$weights^2)
+
+
+# Figure for balance - Love plot
+plm <- love.plot(
+  m.out,
+  threshold = 0.1,
+  abs = TRUE, 
+  stats = "mean.diffs",      
+  var.order = "unadjusted",  
+  drop.distance = TRUE,     
+  sample.names = c("Before matching", "After matching"),
+    size = 4,
+    var.names = c(
+    AGS = "Age at surgery",
+    YEARS = "Year of surgery",
+    BMI = "Body mass index",
+    GENDER = "Female gender",
+    PREOPRNPLN = "Preop pyelonephritis",
+    HISTOINJ = "History of injection",
+    VURSIDE = "Right-sided VUR",
+    UDR7M = "Ureteral dilation ≥ 7mm",
+    PREOPTYPEU1 = "Preop febrile UTIs",
+    PREOPRNSCR = "Preop renal scarring",
+    VURPHASE_1 = "Reflux: voiding phase",
+    VURPHASE_2 = "Reflux: filling phase",
+    VURPHASE_3 = "Reflux: filling + voiding",
+    SURGTECH2_1 = "Surgeon experience ≥100 operations",
+    SURGTECH2_2 = "Surgeon experience 50-100 operations",
+    SURGTECH2_3 = "Surgeon experience <50 operations",
+    PREOPEPISODE1_1 = "Preop UTI episodes: 1",
+    PREOPEPISODE1_2 = "Preop UTI episodes: 2",
+    PREOPEPISODE1_3 = "Preop UTI episodes: ≥3",
+    SURGIND2_1 = "Indication: breakthrough UTI",
+    SURGIND2_2 = "Indication: high-grade reflux (III-V)",
+    SURGIND2_3 = "Indication: poor compliance to medical treatment",
+    SURGIND2_4 = "Indication: ineffective/poorly tolerated CAP",
+    SURGIND2_5 = "Indication: other",
+    PREOPVURGRADE_3 = "Preop VUR grade: III",
+    PREOPVURGRADE_4 = "Preop VUR grade: IV",
+    PREOPVURGRADE_5 = "Preop VUR grade: V"
+  )
+  )
+
+plm <- plm +
+  scale_color_manual(
+    values = c(
+      "Before matching" = "#0072B2",
+      "After matching" = "#D55E00"
+    )
+     )+
+    labs(
+        x = "Absolute Standardized Differences",
+      subtitle = "Matched population"
+  ) +
+    theme(
+      plot.margin = margin(10, 10, 10, 10),
+      axis.text = element_text(size = 16),
+      axis.title = element_text(size = 16),
+      plot.title = element_text(size = 16),
+      legend.text = element_text(size = 16),
+      legend.title = element_text(size = 16),
+      axis.ticks = element_line(size = 0.5, color = "black"),
+      axis.line = element_line(size = 0.5, color = "black"),
+      panel.background = element_blank(), 
+      panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank(),
+      panel.border = element_blank(),
+      axis.ticks.length = unit(0.3, "cm"),
+      panel.spacing = unit(2, "lines")
+   )
+
+ggsave ("figures/love_plot_m.png", plot = plm, width = 12, height = 10, dpi = 300)
+
+
+# Compute mean SMD
+smd_df_m <- balm$Balance
+mean_smd_before_m <- mean(abs(smd_df_m$Diff.Un), na.rm = TRUE) # calculate mean SMD before matching
+mean_smd_after_m <- mean(abs(smd_df_m$Diff.Adj), na.rm = TRUE) # calculate mean SMD before matching
+mean_smd_m <- data.frame(
+  Mean_SMD_Before = mean_smd_before_m,
+  Mean_SMD_After = mean_smd_after_m
+)
+
+mean_smd_m
+
+
+# propensity score distribution: MatchIt does not store the propensity scores in m.out$ps. Instead, they are stored in m.out$distance.
+summary(m.out$distance)
+hist(m.out$distance)
+
+ggplot(
+  data.frame(
+    ps = m.out$distance,
+    Treatment  = factor(Out$Treatment)
+  ),
+  aes(ps, fill = Treatment)
+) +
+  geom_histogram(alpha = 0.5, bins = 30, position = "identity",   color = "black", linewidth = 0.3 ) +
+    scale_fill_viridis_d(
+    option = "mako",
+    begin = 0.3,
+    end = 0.8,
+    labels = c("Cohen", "Lich–Gregoir")
+  ) +
+  labs(
+    x = "Propensity score",
+    y = "Count",
+    fill = "Treatment"
+  ) +
+  theme_bw()
+
+ggsave("figures/propensity_psm.png",
+       width = 12,
+       height = 10,
+       dpi = 300)
+
+# Distributional balance for propensity score
+
+# Before-After matching
+p_psm <- bal.plot(
+  m.out,
+  var.name = "distance",
+  type = "density",
+  which = "both"    
+) 
+
+p_psm <- p_psm +
+  scale_color_viridis_d(
+    option = "mako",
+    begin = 0.3,
+    end = 0.8,
+    labels = c("Cohen group", "Lich–Gregoir group")
+  ) +
+  scale_fill_viridis_d(
+    option = "mako",
+    begin = 0.3,
+    end = 0.8,
+    labels = c("Cohen group", "Lich–Gregoir group")
+  )
+
+ggsave(
+  "figures/PS_density_before_after_m.png",
+  p_psm,
+  width = 10,
+  height = 6,
+  dpi = 300
+)
+```
+
+### 2 Descriptive analysis: AFTER matching
+
+```{r descriptivem, warning=FALSE}
+
+# mdata is the dataset with added weights_psm
+
+# Convert variables to appropriate data types for analysis
+mdata <- mdata %>%
+  mutate(
+    across(c(PID, QCODE), as.character),
+    
+    across(c(AGS, YEARS,BLDLOSS, BMI, CATHPERIOD, FUPM, HOSPTIME,OPRTIME,
+             POSTUTIFUP, POSTUTI_T), as.numeric),
+    
+    across(c(ANASTOMO,BLDCOMPLEAK,BLDCOMPRETN,
+             BLDCOMPVOID,BLDSPASM,CATH,CENTER,CLAVIENCLASS,EPIDURAL,GENDER,
+             GU30, GU90N, GUER30, GUER90, HEMAT, 
+             HISTOINJ,ILEUS, INCCOMPBLEED, INCCOMPINF, INCCOMPSCAR, NARC, 
+             NONARC, PAIN, PREOPEPISODE1, PREOPRNPLN, PREOPRNSCR, PREOPTYPEU1,
+             PREOPVURGRADE, PROC365, STENT, SURGIND, SURGTECH2, TRT2, UDR7M,
+             URCOMPCVUR, URCOMPINJ, URCOMPOBST, URCOMPSTEN, POSTUTI, VURPHASE,
+             VURSIDE, RECGRADE_MAX, SURGIND2, LUTD, OBST, SURG, GU90,
+             CATHPERIOD_G, ANY, MINOR, MAJOR), as.factor)
+  )
+
+str(mdata) # 194 obs. of 71 variables
+
+
+# Matched baseline characteristics
+table1m<- mdata %>%
+  select(YEARS, AGS, GENDER, BMI, HISTOINJ, SURGIND2, PREOPVURGRADE, VURSIDE, UDR7M, 
+         VURPHASE, PREOPTYPEU1, PREOPEPISODE1, PREOPRNPLN, PREOPRNSCR,
+         SURGTECH2, CENTER, TRT2
+  ) %>%
+  tbl_summary(
+    by = TRT2,  # for stratification
+    statistic = list(
+      all_continuous() ~ "{median} ({p25}-{p75})",
+      all_categorical() ~ "{n} ({p}%)" 
+    ),
+    digits = all_categorical() ~ c(0, 1),  # n = 0 decimals, p = 1 decimal
+    missing = "ifany",  # shows missing only when present
+    missing_text = "Missing"
+  ) %>%
+  add_overall() %>%
+  bold_labels()
+
+table1m <- table1m %>%
+  modify_caption(
+    "Baseline characteristics after 1:1 propensity score matching"
+  )
+
+table1m %>%
+  as_flex_table() %>%
+  flextable::save_as_docx(path = "output/baseline_m.docx")
+
+
+# Matched procedural factors
+table2m<- mdata %>%
+  select(TRT2, OPRTIME, STENT, CATH, CATHPERIOD, CATHPERIOD_G, HOSPTIME) %>%
+  tbl_summary(
+    by = TRT2,  # for stratification
+    statistic = list(
+      all_continuous() ~ "{median} ({p25}-{p75})", # or ~ "{mean} ± {sd}",
+      all_categorical() ~ "{n} ({p}%)" 
+    ),
+    digits = all_categorical() ~ c(0, 1),  # n = 0 decimals, p = 1 decimal
+    missing = "ifany",
+    missing_text = "Missing"
+  ) %>%
+  add_overall() %>%
+  add_p(pvalue_fun = ~style_pvalue(.x, digits = 3)) %>%  #  3 decimals 
+  bold_labels()
+
+table2m
+
+table2m %>%
+  as_flex_table() %>%
+  flextable::save_as_docx(path = "output/procedural_m.docx")
+
+# Outcomes
+table3m<- mdata %>%
+  select(TRT2, FUPM, LUTD, OBST, URCOMPINJ, SURG, ILEUS, CLAVIENCLASS, URCOMPCVUR,
+         GU30, GU90, GU90N, GUER30, GUER90, PROC365, 
+         BLDLOSS, BLDSPASM, HEMAT, 
+         POSTUTI) %>%
+  tbl_summary(
+    by = TRT2,  # for stratification
+    statistic = list(
+      all_continuous() ~ "{median} ({p25}-{p75})", # or ~ "{mean} ± {sd}",
+      all_categorical() ~ "{n} ({p}%)" 
+    ),
+    digits = all_categorical() ~ c(0, 1),  # n = 0 decimals, p = 1 decimal
+    missing = "ifany",
+    missing_text = "Missing"
+  ) %>%
+  add_overall() %>%
+  add_p(pvalue_fun = ~style_pvalue(.x, digits = 3)) %>%  #  3 decimals 
+  bold_labels()
+
+table3m
+
+table3m %>%
+  as_flex_table() %>%
+  flextable::save_as_docx(path = "output/outcomes_m.docx")
+
+
+######## Postoperative UTI outcome as time-to-event outcome: Weighted survival curve
+fit_psm <- survfit(
+  Surv(POSTUTIFUP, POSTUTI == 1) ~ Treatment,
+  data = mdata
+)
+
+logrank_test <- survdiff(
+  Surv(POSTUTIFUP, POSTUTI == 1) ~ TRT2,
+  data = mdata
+)
+
+p_value <- 1 - pchisq(
+  logrank_test$chisq,
+  df = length(logrank_test$n) - 1
+)
+
+p_label <- paste0("Log-rank test p = ", format.pval(p_value, digits = 3, eps = 0.001))
+
+p_u_psm <- ggsurvplot(
+  fit_psm,
+  data = mdata,
+  fun = "event",
+  pval = p_label,
+  pval.size = 4,
+  pval.coord = c(0, 0.9),  #  c(x,y) according to my x and y scale
+  conf.int = TRUE,
+  risk.table = TRUE,
+  risk.table.y.text = FALSE,   # to remove text from y-axis in the risk table
+  risk.table.fontsize = 4,   # controls numbers in table
+  xlim = c(0,135),
+  break.time.by = 12,
+  xlab = "Follow-up time",
+  ylab = "Cumulative incidence of postoperative symptomatic UTI",
+  palette = c("#ADD8E6", "#00008B"),
+  legend.title = "Treatment",
+  legend.labs = c("Cohen Group", "Lich-Gregoir Group"),
+  ylim = c(0,1)
+)
+
+#-----------------------
+# Customize the plot
+#-----------------------
+p_u_psm$plot <- p_u_psm$plot +
+  scale_x_continuous(
+    limits = c(0, 135),
+    breaks = seq(0, 135, 12)
+  ) +
+  scale_y_continuous(
+    labels = function(x) paste0(round(x * 100, 1), "%"),
+    limits = c(0, 1)
+  ) +
+  theme_classic() +   # Many clinical epidemiology journals prefer theme_classic() instead of theme_bw() as it automatically removes all gridlines
+  theme(
+    axis.title.x = element_text(size = 12),
+    axis.title.y = element_text(size = 12),
+    axis.text.x  = element_text(size = 10),
+    axis.text.y  = element_text(size = 10),
+    legend.title = element_text(size = 11),
+    legend.text  = element_text(size = 10)
+  )
+
+#----------------------------
+# Customize the risk table
+#----------------------------
+p_u_psm$table <- p_u_psm$table +
+  scale_x_continuous(
+    limits = c(0, 135),
+    breaks = seq(0, 135, 12)
+  ) +
+  theme(
+    axis.title.x = element_blank(),
+    axis.text.x  = element_blank(),
+    axis.ticks.x = element_blank(),
+    axis.line.x  = element_blank(),
+    axis.line.y  = element_blank(),
+    plot.title   = element_text(size = 12),
+    text         = element_text(size = 10),
+    axis.title.y = element_text(size = 12)
+  )
+
+#------------------------------------------------------------
+# Combine plot and risk table
+#------------------------------------------------------------
+final_plot_psm <- p_u_psm$plot / p_u_psm$table +
+  plot_layout(heights = c(4, 1))
+
+
+#------------------------------------------------------------
+# Save the figure
+#------------------------------------------------------------
+ggsave(
+  filename = "figures/UTI_m.png",
+  plot = final_plot_psm,
+  width = 8,
+  height = 6,
+  dpi = 300
+)
+
+# Estimated 1-year survival
+s_psm <- summary(fit_psm, times = 12, extend = TRUE)
+
+# Estimated 1-year cumulative probability of UTI
+uti_1yr_psm <- data.frame(
+  Treatment = s_psm$strata,
+  UTI_1yr = 100 * (1 - s_psm$surv),
+  Lower_95CI = 100 * (1 - s_psm$upper),
+  Upper_95CI = 100 * (1 - s_psm$lower)
+)
+
+uti_1yr_psm
+```
+
+### 3 Regression
+
+#### Block 1 - without VUR recurrence
+
+```{r reg1m_norec}
+
+# GEE model after matching - Accounting for center-clustering
+
+# Block 1: technique effect on postoperative outcomes = Univariable analyses
+
+outcomes <- c(
+  "LUTD",
+  "OBST",
+  "URCOMPINJ",
+  "SURG",
+  "ILEUS",
+  "GU30",
+  "GU90",
+  "PROC365"
+)
+
+# convert outcomes to numeric
+mdata[outcomes] <- lapply(
+  mdata[outcomes],
+  function(x) as.numeric(as.character(x))
+)
+
+# Apply GEE model after matching for all binary outcomes
+gee_results_psm <- lapply(outcomes, function(y) {
+  formula <- as.formula(
+    paste(y, "~ TRT2")
+  )
+  model <- geeglm(
+    formula,
+    data = mdata,
+    id = CENTER,
+    weights = weights_psm,       # weights have no effect because weights are all equal
+    family = binomial(link = "logit"),
+    corstr = "exchangeable"
+  )
+  tidy(model, exponentiate = TRUE, conf.int = TRUE) 
+})
+names(gee_results_psm) <- outcomes
+
+
+# Combine results into one table
+gee_table_psm <- do.call(
+  rbind,
+  lapply(names(gee_results_psm), function(x){
+    tmp <- gee_results_psm[[x]]
+    tmp <- tmp %>%
+      filter(grepl("^TRT2", term)) %>%
+      mutate(outcome = x)
+    tmp
+  })
+)
+
+# Create final manuscript table
+gee_table_final_psm <- gee_table_psm %>%
+  mutate(
+    Effect_measure = "OR",
+    Estimate = sprintf("%.2f", estimate),
+    CI = paste0(
+      sprintf("%.2f", conf.low),
+      "–",
+      sprintf("%.2f", conf.high)
+    ),
+    P_value = p.value
+  ) %>%
+  dplyr::select(
+    Outcome = outcome,
+    Effect_measure,
+    Estimate,
+    CI,
+    P_value
+  )
+
+
+# Cox model for POSTUTI
+
+cox_uti_psm <- coxph(
+  Surv(POSTUTIFUP, POSTUTI == 1) ~ TRT2 + strata(CENTER),
+  data = mdata,
+  weights = weights_psm,  # weights have no effect
+  robust = TRUE,
+  cluster = subclass  
+)
+
+cox_summarypsm <- summary(cox_uti_psm)
+
+cox_row <- grep(
+  "^TRT2",
+  rownames(cox_summarypsm$coefficients)
+)
+
+POSTUTI_table_psm <- data.frame(
+  Outcome = "POSTUTI",
+  Effect_measure = "HR",
+  Estimate = sprintf(
+    "%.2f",
+    cox_summarypsm$coefficients[
+      cox_row,
+      "exp(coef)"
+    ]
+  ),
+  CI = paste0(
+    sprintf("%.2f",
+            cox_summarypsm$conf.int[cox_row, "lower .95"]),
+    "–",
+    sprintf("%.2f",
+            cox_summarypsm$conf.int[cox_row, "upper .95"])
+  ),
+  P_value = cox_summarypsm$coefficients[
+    cox_row,
+    "Pr(>|z|)"
+  ]
+)
+
+# Combine final results
+final_resultspsm <- rbind(
+  gee_table_final_psm,
+  POSTUTI_table_psm
+)
+
+
+# Multiple correction
+
+## Bonferroni correction
+final_resultspsm$p_bonferroni <- p.adjust(
+  final_resultspsm$P_value,
+  method = "bonferroni"
+)
+
+## Holm-Bonferroni
+final_resultspsm$p_holm <- p.adjust(
+  final_resultspsm$P_value,
+  method = "holm"
+)
+
+## Benjamini-Hochberg FDR
+final_resultspsm$p_FDR <- p.adjust(
+  final_resultspsm$P_value,
+  method = "BH"
+)
+
+
+final_resultspsm <- final_resultspsm %>%
+  mutate(
+    across(
+      c(P_value, p_bonferroni, p_holm, p_FDR),
+      ~case_when(
+        .x < 0.001 ~ "<0.001",
+        TRUE ~ sprintf("%.3f", .x)
+      )
+    )
+  )
+
+final_resultspsm
+
+final_resultspsm %>%
+  flextable() %>%
+  theme_booktabs() %>%
+  autofit() %>%
+  align(
+    j = c("Estimate", "CI", "P_value"),
+    align = "center",
+    part = "all"
+  ) %>%
+  save_as_docx(
+    path = "output/treatment_unadj_m_norec.docx"
+  )
+
+```
+
+#### Block 2 - without VUR recurrence
+
+```{r reg2m_norec}
+
+# Block 2: exposure-effect analysis (stent) on postoperative outcomes = Multivariable analyses
+
+outcomes <- c(
+  "LUTD",
+  "OBST",
+  "URCOMPINJ",
+  "SURG",
+  "ILEUS",
+  "GU30",
+  "GU90",
+  "PROC365"
+)
+
+# convert outcomes to numeric
+mdata[outcomes] <- lapply(
+  mdata[outcomes],
+  function(x) as.numeric(as.character(x))
+)
+
+# Predictors to include in the outcome models
+predictors <- c("TRT2", "STENT")
+
+
+# Apply GEE model after overlap weighting for all binary outcomes
+gee_results_psm2 <- lapply(outcomes, function(y) {
+  formula <- as.formula(
+    paste(y, "~",
+          paste(predictors, collapse = " + ")
+   )
+  )  
+  model <- geeglm(
+    formula,
+    data = mdata,
+    id = CENTER,
+    weights = weights_psm,    # weights have no effect because weights are all equal
+    family = binomial(link = "logit"),
+    corstr = "exchangeable"
+  )
+  tidy(model, exponentiate = TRUE, conf.int = TRUE) 
+})
+names(gee_results_psm2) <- outcomes
+
+# Combine results into one table
+gee_table_psm2 <- do.call(
+  rbind,
+  lapply(names(gee_results_psm2), function(x){
+    tmp <- gee_results_psm2[[x]]
+    tmp %>%
+      mutate(outcome = x)
+  })
+)
+
+# Create final manuscript table
+gee_table_final_psm2 <- gee_table_psm2 %>%
+  mutate(
+    Effect_measure = "OR",
+    Estimate = sprintf("%.2f", estimate),
+    CI = paste0(
+      sprintf("%.2f", conf.low),
+      "–",
+      sprintf("%.2f", conf.high)
+    ),
+    P_value = p.value
+  ) %>%
+  dplyr::select(
+    Outcome = outcome,
+    Predictor = term,
+    Effect_measure,
+    Estimate,
+    CI,
+    P_value
+  )
+
+
+# Cox model for POSTUTI
+
+cox_uti_psm2 <- coxph(
+  Surv(POSTUTIFUP, POSTUTI == 1) ~ TRT2 + STENT + strata(CENTER),
+  data = mdata,
+  weights = weights_psm,  # weights have no effect
+  robust = TRUE,
+  cluster = subclass   
+)
+
+cox_summarypsm2 <- summary(cox_uti_psm2)
+
+cox_row <- rownames(cox_summarypsm2$coefficients)
+
+POSTUTI_table_psm2 <- data.frame(
+  Outcome = "POSTUTI",
+  Predictor = rownames(cox_summarypsm2$coefficients),
+  Effect_measure = "HR",
+  Estimate = sprintf(
+    "%.2f",
+    cox_summarypsm2$coefficients[
+      cox_row,
+      "exp(coef)"
+    ]
+  ),
+  CI = paste0(
+    sprintf("%.2f",
+            cox_summarypsm2$conf.int[cox_row, "lower .95"]),
+    "–",
+    sprintf("%.2f",
+            cox_summarypsm2$conf.int[cox_row, "upper .95"])
+  ),
+  P_value = cox_summarypsm2$coefficients[
+    cox_row,
+    "Pr(>|z|)"
+  ]
+)
+
+
+# Combine final results
+final_results_psm2 <- rbind(
+  gee_table_final_psm2,
+  POSTUTI_table_psm2
+)
+
+
+final_results_psm2
+
+final_results_psm2 <- final_results_psm2 %>%
+  mutate(
+    across(
+      c(P_value),
+      ~case_when(
+        .x < 0.001 ~ "<0.001",
+        TRUE ~ sprintf("%.3f", .x)
+      )
+    )
+  )
+
+
+final_results_psm2 %>%
+  flextable() %>%
+  theme_booktabs() %>%
+  autofit() %>%
+  align(
+    j = c("Estimate", "CI", "P_value"),
+    align = "center",
+    part = "all"
+  ) %>%
+  save_as_docx(
+    path = "output/treatment_adj_all_m_norec.docx"
+  )
+
+
+# Multiple correction
+
+# Extract TRT2 rows only
+
+gee_trt2_psm2 <- gee_table_final_psm2 %>%
+  filter(grepl("^TRT2", Predictor))
+
+POSTUTI_trt2_psm2 <- POSTUTI_table_psm2 %>%
+  filter(grepl("^TRT2", Predictor))
+
+# Combine only treatment effects
+treatment_results_psm2 <- rbind(
+  gee_trt2_psm2,
+  POSTUTI_trt2_psm2
+)
+
+# Apply Correction
+
+treatment_results_psm2$p_bonferroni <- p.adjust(
+  as.numeric(treatment_results_psm2$P_value),
+  method = "bonferroni"                             # Bonferroni correction
+)
+
+treatment_results_psm2$p_holm <- p.adjust(
+  as.numeric(treatment_results_psm2$P_value),
+  method = "holm"                                   # Holm-Bonferroni
+)
+
+treatment_results_psm2$p_FDR <- p.adjust(
+  as.numeric(treatment_results_psm2$P_value),
+  method = "BH"                                    # Benjamini-Hochberg FDR
+)
+
+
+treatment_results_psm2 <- treatment_results_psm2 %>%
+  mutate(
+    across(
+      c(P_value, p_bonferroni, p_holm, p_FDR),
+      ~case_when(
+        .x < 0.001 ~ "<0.001",
+        TRUE ~ sprintf("%.3f", .x)
+      )
+    )
+  )
+
+treatment_results_psm2
+
+treatment_results_psm2 %>%
+  flextable() %>%
+  theme_booktabs() %>%
+  autofit() %>%
+  align(
+    j = c("Estimate", "CI", "P_value"),
+    align = "center",
+    part = "all"
+  ) %>%
+  save_as_docx(
+    path = "output/treatment_adj_m_norec.docx"
+  )
+
+
+# ADDITIONAL MULTIPLE COMPARISONS
+
+# Extract STENT rows only
+
+gee_st_psm2 <- gee_table_final_psm2 %>%
+  filter(grepl("^STENT", Predictor))
+
+POSTUTI_st_psm2 <- POSTUTI_table_psm2 %>%
+  filter(grepl("^STENT", Predictor))
+
+# Combine only stent effects
+st_results_psm2 <- rbind(
+  gee_st_psm2,
+  POSTUTI_st_psm2
+)
+
+# Apply Correction
+
+st_results_psm2$p_bonferroni <- p.adjust(
+  as.numeric(st_results_psm2$P_value),
+  method = "bonferroni"                             # Bonferroni correction
+)
+
+st_results_psm2$p_holm <- p.adjust(
+  as.numeric(st_results_psm2$P_value),
+  method = "holm"                                   # Holm-Bonferroni
+)
+
+st_results_psm2$p_FDR <- p.adjust(
+  as.numeric(st_results_psm2$P_value),
+  method = "BH"                                    # Benjamini-Hochberg FDR
+)
+
+
+st_results_psm2 <- st_results_psm2 %>%
+  mutate(
+    across(
+      c(P_value, p_bonferroni, p_holm, p_FDR),
+      ~case_when(
+        .x < 0.001 ~ "<0.001",
+        TRUE ~ sprintf("%.3f", .x)
+      )
+    )
+  )
+
+st_results_psm2
+
+st_results_psm2 %>%
+  flextable() %>%
+  theme_booktabs() %>%
+  autofit() %>%
+  align(
+    j = c("Estimate", "CI", "P_value"),
+    align = "center",
+    part = "all"
+  ) %>%
+  save_as_docx(
+    path = "output/stent_adj_m_norec.docx"
+  )
+```
+
+
+
+#### Block 2i1 - without VUR recurrence
+
+```{r reg2m_norec}
+
+# Block 2: exposure-effect analysis (stent) on postoperative outcomes = Multivariable analyses
+
+outcomes <- c(
+  "LUTD",
+  "OBST",
+  "URCOMPINJ",
+  "SURG",
+  "ILEUS",
+  "GU30",
+  "GU90",
+  "PROC365"
+)
+
+# convert outcomes to numeric
+mdata[outcomes] <- lapply(
+  mdata[outcomes],
+  function(x) as.numeric(as.character(x))
+)
+
+# Predictors to include in the outcome models
+predictors <- "TRT2 * STENT"
+
+
+# Apply GEE model after overlap weighting for all binary outcomes
+gee_results_psm2 <- lapply(outcomes, function(y) {
+  formula <- as.formula(
+    paste(y, "~",
+          paste(predictors, collapse = " + ")
+   )
+  )  
+  model <- geeglm(
+    formula,
+    data = mdata,
+    id = CENTER,
+    weights = weights_psm,    # weights have no effect because weights are all equal
+    family = binomial(link = "logit"),
+    corstr = "exchangeable"
+  )
+  tidy(model, exponentiate = TRUE, conf.int = TRUE)   # estimate = OR because exponentiate = TRUE
+})
+names(gee_results_psm2) <- outcomes
+
+# Combine results into one table
+gee_table_psm2 <- do.call(
+  rbind,
+  lapply(names(gee_results_psm2), function(x){
+    tmp <- gee_results_psm2[[x]]
+    tmp %>%
+      mutate(outcome = x)
+  })
+)
+
+# Create final manuscript table
+gee_table_final_psm2 <- gee_table_psm2 %>%
+  mutate(
+    Effect_measure = "OR",
+    Estimate = sprintf("%.2f", estimate),
+    CI = paste0(
+      sprintf("%.2f", conf.low),
+      "–",
+      sprintf("%.2f", conf.high)
+    ),
+    P_value = p.value
+  ) %>%
+  dplyr::select(
+    Outcome = outcome,
+    Predictor = term,
+    Effect_measure,
+    Estimate,
+    CI,
+    P_value
+  )
+
+
+# Cox model for POSTUTI
+
+cox_uti_psm2 <- coxph(
+  Surv(POSTUTIFUP, POSTUTI == 1) ~ TRT2*STENT + strata(CENTER),
+  data = mdata,
+  weights = weights_psm,  # weights have no effect
+  robust = TRUE,
+  cluster = subclass   
+)
+
+cox_summarypsm2 <- summary(cox_uti_psm2)
+
+cox_row <- rownames(cox_summarypsm2$coefficients)
+
+POSTUTI_table_psm2 <- data.frame(
+  Outcome = "POSTUTI",
+  Predictor = rownames(cox_summarypsm2$coefficients),
+  Effect_measure = "HR",
+  Estimate = sprintf(
+    "%.2f",
+    cox_summarypsm2$coefficients[
+      cox_row,
+      "exp(coef)"
+    ]
+  ),
+  CI = paste0(
+    sprintf("%.2f",
+            cox_summarypsm2$conf.int[cox_row, "lower .95"]),
+    "–",
+    sprintf("%.2f",
+            cox_summarypsm2$conf.int[cox_row, "upper .95"])
+  ),
+  P_value = cox_summarypsm2$coefficients[
+    cox_row,
+    "Pr(>|z|)"
+  ]
+)
+
+
+# Combine final results
+final_results_psm2 <- rbind(
+  gee_table_final_psm2,
+  POSTUTI_table_psm2
+)
+
+
+final_results_psm2
+
+final_results_psm2 <- final_results_psm2 %>%
+  mutate(
+    across(
+      c(P_value),
+      ~case_when(
+        .x < 0.001 ~ "<0.001",
+        TRUE ~ sprintf("%.3f", .x)
+      )
+    )
+  )
+
+
+final_results_psm2 %>%
+  flextable() %>%
+  theme_booktabs() %>%
+  autofit() %>%
+  align(
+    j = c("Estimate", "CI", "P_value"),
+    align = "center",
+    part = "all"
+  ) %>%
+  save_as_docx(
+    path = "output/treatment_adj_all_m_norec_i.docx"
+  )
+
+
+# Multiple correction
+
+# Extract TRT2 rows only
+
+gee_trt2_psm2 <- gee_table_final_psm2 %>%
+  filter(grepl("^TRT2", Predictor))
+
+POSTUTI_trt2_psm2 <- POSTUTI_table_psm2 %>%
+  filter(grepl("^TRT2", Predictor))
+
+# Combine only treatment effects
+treatment_results_psm2 <- rbind(
+  gee_trt2_psm2,
+  POSTUTI_trt2_psm2
+)
+
+# Apply Correction
+
+treatment_results_psm2$p_bonferroni <- p.adjust(
+  as.numeric(treatment_results_psm2$P_value),
+  method = "bonferroni"                             # Bonferroni correction
+)
+
+treatment_results_psm2$p_holm <- p.adjust(
+  as.numeric(treatment_results_psm2$P_value),
+  method = "holm"                                   # Holm-Bonferroni
+)
+
+treatment_results_psm2$p_FDR <- p.adjust(
+  as.numeric(treatment_results_psm2$P_value),
+  method = "BH"                                    # Benjamini-Hochberg FDR
+)
+
+
+treatment_results_psm2 <- treatment_results_psm2 %>%
+  mutate(
+    across(
+      c(P_value, p_bonferroni, p_holm, p_FDR),
+      ~case_when(
+        .x < 0.001 ~ "<0.001",
+        TRUE ~ sprintf("%.3f", .x)
+      )
+    )
+  )
+
+treatment_results_psm2
+
+treatment_results_psm2 %>%
+  flextable() %>%
+  theme_booktabs() %>%
+  autofit() %>%
+  align(
+    j = c("Estimate", "CI", "P_value"),
+    align = "center",
+    part = "all"
+  ) %>%
+  save_as_docx(
+    path = "output/treatment_adj_m_norec_i.docx"
+  )
+
+
+# ADDITIONAL MULTIPLE COMPARISONS
+
+# Extract STENT rows only
+
+gee_st_psm2 <- gee_table_final_psm2 %>%
+  filter(grepl("^STENT", Predictor))
+
+POSTUTI_st_psm2 <- POSTUTI_table_psm2 %>%
+  filter(grepl("^STENT", Predictor))
+
+# Combine only stent effects
+st_results_psm2 <- rbind(
+  gee_st_psm2,
+  POSTUTI_st_psm2
+)
+
+# Apply Correction
+
+st_results_psm2$p_bonferroni <- p.adjust(
+  as.numeric(st_results_psm2$P_value),
+  method = "bonferroni"                             # Bonferroni correction
+)
+
+st_results_psm2$p_holm <- p.adjust(
+  as.numeric(st_results_psm2$P_value),
+  method = "holm"                                   # Holm-Bonferroni
+)
+
+st_results_psm2$p_FDR <- p.adjust(
+  as.numeric(st_results_psm2$P_value),
+  method = "BH"                                    # Benjamini-Hochberg FDR
+)
+
+
+st_results_psm2 <- st_results_psm2 %>%
+  mutate(
+    across(
+      c(P_value, p_bonferroni, p_holm, p_FDR),
+      ~case_when(
+        .x < 0.001 ~ "<0.001",
+        TRUE ~ sprintf("%.3f", .x)
+      )
+    )
+  )
+
+st_results_psm2
+
+st_results_psm2 %>%
+  flextable() %>%
+  theme_booktabs() %>%
+  autofit() %>%
+  align(
+    j = c("Estimate", "CI", "P_value"),
+    align = "center",
+    part = "all"
+  ) %>%
+  save_as_docx(
+    path = "output/stent_adj_m_norec_i.docx"
+  )
+```
+
+
+#### Block 2i2 - without VUR recurrence + with interaction (to calculate OR for two levels) (secondary effect-modification analysis)
+
+```{r reg2m_norec}
+
+# Block 2: exposure-effect analysis (stent) on postoperative outcomes = Multivariable analyses
+
+outcomes <- c(
+  "LUTD",
+  "OBST",
+  "URCOMPINJ",
+  "SURG",
+  "ILEUS",
+  "GU30",
+  "GU90",
+  "PROC365"
+)
+
+# convert outcomes to numeric
+mdata[outcomes] <- lapply(
+  mdata[outcomes],
+  function(x) as.numeric(as.character(x))
+)
+
+
+# Apply GEE model after overlap weighting for all binary outcomes
+get_gee_results_psm2 <- function(y) {
+  
+  formula <- as.formula(
+    paste(y, "~ TRT2 * STENT")
+  )
+  
+  model <- geeglm(
+    formula,
+    data = mdata,
+    id = CENTER,
+    weights = weights_psm,    # weights have no effect because weights are all equal
+    family = binomial(link = "logit"),
+    corstr = "exchangeable"
+  )
+  
+  # Coefficients
+  beta <- coef(model)
+  
+  # Robust covariance matrix
+  V <- vcov(model)
+  
+  # -------------------------------------------------------
+  # LG vs Cohen among NO-STENT patients
+  # -------------------------------------------------------
+  
+  b_no_stent <- beta["TRT21"]
+  
+  se_no_stent <- sqrt(
+    V["TRT21", "TRT21"]
+  )
+  
+  OR_no_stent <- exp(b_no_stent)
+  
+  CI_no_stent <- exp(
+    b_no_stent + c(-1, 1) * 1.96 * se_no_stent
+  )
+  
+  # -------------------------------------------------------
+  # LG vs Cohen among STENTED patients
+  # = TRT21 + TRT21:STENT1
+  # -------------------------------------------------------
+  
+  b_stent <- beta["TRT21"] +
+    beta["TRT21:STENT1"]
+  
+  # Variance of the linear combination:
+  # Var(beta1 + beta3)
+  
+  var_stent <-
+    V["TRT21", "TRT21"] +
+    V["TRT21:STENT1", "TRT21:STENT1"] +
+    2 * V["TRT21", "TRT21:STENT1"]
+  
+  se_stent <- sqrt(var_stent)
+  
+  OR_stent <- exp(b_stent)
+  
+  CI_stent <- exp(
+    b_stent + c(-1, 1) * 1.96 * se_stent
+  )
+  
+  # -------------------------------------------------------
+  # Interaction test
+  # -------------------------------------------------------
+  
+  b_interaction <- beta["TRT21:STENT1"]
+  
+  se_interaction <- sqrt(
+    V["TRT21:STENT1", "TRT21:STENT1"]
+  )
+  
+  z_interaction <- b_interaction / se_interaction
+  
+  p_interaction <- 2 * pnorm(
+    abs(z_interaction),
+    lower.tail = FALSE
+  )
+  
+  # -------------------------------------------------------
+  # Return manuscript-ready results
+  # -------------------------------------------------------
+  
+  data.frame(
+    Outcome = y,
+    
+    `LG vs Cohen, No Stent` =
+      sprintf(
+        "%.2f (%.2f–%.2f)",
+        OR_no_stent,
+        CI_no_stent[1],
+        CI_no_stent[2]
+      ),
+    
+    `LG vs Cohen, Stent` =
+      sprintf(
+        "%.2f (%.2f–%.2f)",
+        OR_stent,
+        CI_stent[1],
+        CI_stent[2]
+      ),
+    
+    P_interaction = p_interaction,
+    
+    stringsAsFactors = FALSE
+  )
+}
+
+
+# Run for all 8 outcomes
+interaction_results_m <- do.call(
+  rbind,
+  lapply(outcomes, get_gee_results_psm2)
+)
+
+
+interaction_results_m
+
+
+# Cox model for POSTUTI
+
+cox_uti_psm2 <- coxph(
+  Surv(POSTUTIFUP, POSTUTI == 1) ~ TRT2*STENT + strata(CENTER),
+  data = mdata,
+  weights = weights_psm,  # weights have no effect
+  robust = TRUE,
+  cluster = subclass   
+)
+
+# Coefficients
+beta_cox <- coef(cox_uti_psm2)
+
+# Covariance matrix
+V_cox <- vcov(cox_uti_psm2)
+
+# -------------------------------------------------------
+# LG vs Cohen among NO-STENT patients
+# -------------------------------------------------------
+
+b_no_stent_cox <- beta_cox["TRT21"]
+
+se_no_stent_cox <- sqrt(
+  V_cox["TRT21", "TRT21"]
+)
+
+HR_no_stent <- exp(b_no_stent_cox)
+
+CI_no_stent_cox <- exp(
+  b_no_stent_cox +
+    c(-1, 1) * 1.96 * se_no_stent_cox
+)
+
+
+# -------------------------------------------------------
+# LG vs Cohen among STENTED patients
+# = TRT21 + TRT21:STENT1
+# -------------------------------------------------------
+
+b_stent_cox <- beta_cox["TRT21"] +
+  beta_cox["TRT21:STENT1"]
+
+var_stent_cox <-
+  V_cox["TRT21", "TRT21"] +
+  V_cox["TRT21:STENT1", "TRT21:STENT1"] +
+  2 * V_cox["TRT21", "TRT21:STENT1"]
+
+se_stent_cox <- sqrt(var_stent_cox)
+
+HR_stent <- exp(b_stent_cox)
+
+CI_stent_cox <- exp(
+  b_stent_cox +
+    c(-1, 1) * 1.96 * se_stent_cox
+)
+
+
+# -------------------------------------------------------
+# Interaction p-value
+# -------------------------------------------------------
+
+b_interaction_cox <- beta_cox["TRT21:STENT1"]
+
+se_interaction_cox <- sqrt(
+  V_cox["TRT21:STENT1", "TRT21:STENT1"]
+)
+
+z_interaction_cox <-
+  b_interaction_cox / se_interaction_cox
+
+p_interaction_cox <- 2 * pnorm(
+  abs(z_interaction_cox),
+  lower.tail = FALSE
+)
+
+
+# Create POSTUTI result
+POSTUTI_interaction_m <- data.frame(
+  Outcome = "POSTUTI",
+  
+  `LG vs Cohen, No Stent` =
+    sprintf(
+      "%.2f (%.2f–%.2f)",
+      HR_no_stent,
+      CI_no_stent_cox[1],
+      CI_no_stent_cox[2]
+    ),
+  
+  `LG vs Cohen, Stent` =
+    sprintf(
+      "%.2f (%.2f–%.2f)",
+      HR_stent,
+      CI_stent_cox[1],
+      CI_stent_cox[2]
+    ),
+  
+  P_interaction = p_interaction_cox
+)
+
+POSTUTI_interaction_m
+
+```
+
+### 4 Rosenbaum's sensitivity analyses 
+
+```{r rosenbaum}
+
+# Rosenbaum's primal sensitivity analysis
+
+outcomes <- c(
+  "LUTD",
+  "OBST",
+  "URCOMPINJ",
+  "SURG",
+  "ILEUS",
+  "GU30",
+  "GU90",
+  "PROC365"
+)
+
+# Convert outcomes to numeric
+mdata[outcomes] <- lapply(
+  mdata[outcomes],
+  function(x) as.numeric(as.character(x))
+)
+
+
+# Function for Rosenbaum sensitivity analysis using rbounds
+rosenbaum_binary <- function(outcome, data, match_object, 
+                             gamma_seq = seq(1, 11, by = 0.1),
+                            alpha = 0.05) {  
+  
+  # matched pairs
+  treated_ids <- rownames(match_object$match.matrix)
+  control_ids <- match_object$match.matrix[, 1]
+  
+  pairs <- data.frame(
+    treated = data[treated_ids, outcome],
+    control = data[control_ids, outcome]
+  )
+  
+  # remove missing outcome pairs
+  pairs <- na.omit(pairs)
+  
+  # discordant pairs
+  # x = control has outcome, treated does not
+  # y = treated has outcome, control does not
+  x <- sum(pairs$control == 1 & pairs$treated == 0)
+  y <- sum(pairs$treated == 1 & pairs$control == 0)
+  
+  # run Rosenbaum sensitivity
+  if ((x + y) == 0) {
+    return(data.frame(
+      Outcome = outcome,
+      Discordant_pairs = 0,
+      x = x,
+      y = y,
+      p_Gamma1 = NA,
+      gamma_max = NA,
+      p_gamma_max = NA
+    ))
+  }
+  
+  # Run sensitivity over Gamma values
+
+  gamma_results <- sapply(gamma_seq, function(g) {
+    
+  res <- binarysens(
+      x = x,
+      y = y,
+      Gamma = g,
+      GammaInc = 0.1  # GammaInc defines the increment used to increase Γ values when the function evaluates sensitivity.
+    )
+
+    # extract upper bound p-value corresponding to Gamma g
+    res$bounds$`Upper bound`[
+      res$bounds$Gamma == g
+    ]
+  })
+  
+    # p-value at Gamma = 1
+    p_gamma1 <- gamma_results[gamma_seq == 1]
+  
+    # first Gamma where upper p-value >= alpha
+    idx <- which(gamma_results < alpha)
+
+if(length(idx) == 0){
+
+  if(p_gamma1 >= alpha){
+    
+    gamma_max <- "NS at Gamma=1"
+    p_gamma_max <- NA
+    
+  } else {
+    
+    gamma_max <- paste0(">=", max(gamma_seq))
+    p_gamma_max <- gamma_results[length(gamma_results)]
+    
+  }
+
+} else {
+  
+  gamma_max_value <- gamma_seq[max(idx)]
+  
+  # If still significant at the maximum tested Gamma
+  if(gamma_max_value == max(gamma_seq)){
+    
+    gamma_max <- paste0(">=", max(gamma_seq))
+    
+  } else {
+    
+    gamma_max <- gamma_max_value
+    
+  }
+  
+  p_gamma_max <- gamma_results[max(idx)]
+}
+
+  # Extract p-values from rbounds object
+  data.frame(
+    Outcome = outcome,
+    Discordant_pairs = x + y,
+    x = x,
+    y = y,
+    p_Gamma1 = round(p_gamma1, 3),
+    gamma_max = gamma_max,
+    p_gamma_max = round(p_gamma_max, 3)
+  )
+}
+
+
+# Run all outcomes
+rosenbaum_results <- do.call(
+  rbind,
+  lapply(
+    outcomes,
+    rosenbaum_binary,
+    data = mdata,
+    match_object = m.out
+  )
+)
+
+rosenbaum_results
+
+
+# Rename columns for publication
+rosenbaum_results_pub <- rosenbaum_results %>%
+  rename(
+    Outcome = Outcome,
+    `Discordant pairs` = Discordant_pairs,
+    `Control only events (x)` = x,
+    `Treated only events (y)` = y,
+    `P-value (Γ=1)` = p_Gamma1,
+    `Γmax` = gamma_max,
+    `P-value at Γmax` = p_gamma_max
+  )
+
+
+# Create publication table
+rosenbaum_table <- rosenbaum_results_pub %>%
+  flextable() %>%
+  
+  # Add title
+  add_header_lines(
+    "Rosenbaum’s primal sensitivity analysis for postoperative outcomes in the matched cohort."
+  ) %>%
+  
+  # Add footnote
+  add_footer_lines(
+    "The Gamma value Γ is a measure of sensitivity to hidden bias, representing the magnitude of differential odds of treatment assignment due to an unmeasured confounder that could alter the study conclusion. Γmax refers to the highest value of Γ for which the upper-bound p-value remained below 0.05. P-values correspond to the upper bound."
+  ) %>%
+  
+  theme_booktabs() %>%
+  autofit() %>%
+  
+  align(
+    j = c(
+      "Discordant pairs",
+      "Control only events (x)",
+      "Treated only events (y)",
+      "P-value (Γ=1)",
+      "Γmax",
+      "P-value at Γmax"
+    ),
+    align = "center",
+    part = "all"
+  )
+
+
+# Save as Word document
+save_as_docx(
+  rosenbaum_table,
+  path = "output/Rosenbaum_effect.docx"
+)
+
+```
+
+
+### 5 PAIN - Non-epidural Cohort
+
+#### 5.1 Filter & match the new population
+
+```{r filterpain}
+
+# Filter dataset to only those who did not receive EPIDURAL
+Outp <- Out %>%
+  filter(EPIDURAL == "0") %>%
+  mutate(
+    PAIN = factor(
+      PAIN,
+      levels = c("0", "1", "2", "3"),
+      labels = c(
+        "No pain",
+        "Mild pain (score 1-3)",
+        "Moderate pain (score 4-6)",
+        "Severe pain (score 7-10)"
+      ),
+      ordered = TRUE
+    )
+  )
+
+# Do matching
+
+set.seed(123)
+
+m.outp <- matchit(
+  TRT2 ~ AGS + YEARS + GENDER + BMI + PREOPRNPLN + HISTOINJ +
+    SURGIND2 + PREOPVURGRADE + VURSIDE + UDR7M + VURPHASE +
+    PREOPEPISODE1 + PREOPTYPEU1 + PREOPRNSCR + SURGTECH2,
+  data = Outp,
+  method = "nearest",
+  ratio = 1,  # 1:1 matching (1 treated : 1 control)
+  distance = "logit",
+  caliper = 0.2   
+)
+
+
+mdatap <- match.data(
+  m.outp,
+  weights = "weightsp_psm" 
+)
+readr::write_csv(mdatap, "data/matched_nonepidural_data.csv") 
+
+
+
+# Table for balance
+# This gives: SMD before and after matching, and flagged imbalance (>0.1)
+balmp <- cobalt::bal.tab(m.outp, un = TRUE, ESS = TRUE, m.threshold = 0.1)
+balmp 
+
+balmp_df <- as.data.frame(balmp$Balance)
+smd_tablemp <- balmp_df %>%
+  mutate(
+    Variable = rownames(balmp_df),
+    SMD_Before = round(abs(Diff.Un), 3),
+    SMD_After  = round(abs(Diff.Adj), 3)
+  ) %>%
+  dplyr::select(Variable, SMD_Before, SMD_After) 
+
+smd_tablemp %>%
+  flextable() %>%
+  save_as_docx(path = "output/SMD_psm_p.docx")
+
+
+
+# Figure for balance - Love plot
+plmp <- love.plot(
+  m.outp,
+  threshold = 0.1,
+  abs = TRUE, 
+  stats = "mean.diffs",      
+  var.order = "unadjusted", 
+  drop.distance = TRUE,   
+  sample.names = c("Before matching", "After matching"),
+    size = 4,
+    var.names = c(
+    AGS = "Age at surgery",
+    YEARS = "Year of surgery",
+    BMI = "Body mass index",
+    GENDER = "Female gender",
+    PREOPRNPLN = "Preop pyelonephritis",
+    HISTOINJ = "History of injection",
+    VURSIDE = "Right-sided VUR",
+    UDR7M = "Ureteral dilation ≥ 7mm",
+    PREOPTYPEU1 = "Preop febrile UTIs",
+    PREOPRNSCR = "Preop renal scarring",
+    VURPHASE_1 = "Reflux: voiding phase",
+    VURPHASE_2 = "Reflux: filling phase",
+    VURPHASE_3 = "Reflux: filling + voiding",
+    SURGTECH2_1 = "Surgeon experience ≥100 operations",
+    SURGTECH2_2 = "Surgeon experience 50-100 operations",
+    SURGTECH2_3 = "Surgeon experience <50 operations",
+    PREOPEPISODE1_1 = "Preop UTI episodes: 1",
+    PREOPEPISODE1_2 = "Preop UTI episodes: 2",
+    PREOPEPISODE1_3 = "Preop UTI episodes: ≥3",
+    SURGIND2_1 = "Indication: breakthrough UTI",
+    SURGIND2_2 = "Indication: high-grade reflux (III-V)",
+    SURGIND2_3 = "Indication: poor compliance to medical treatment",
+    SURGIND2_4 = "Indication: ineffective/poorly tolerated CAP",
+    SURGIND2_5 = "Indication: other",
+    PREOPVURGRADE_3 = "Preop VUR grade: III",
+    PREOPVURGRADE_4 = "Preop VUR grade: IV",
+    PREOPVURGRADE_5 = "Preop VUR grade: V"
+  )
+  )
+
+plmp <- plmp +
+    labs(
+    x = "Absolute Standardized Differences",
+    subtitle = "Matched population of children who did not receive epidural analgesia"
+  )
+    theme(
+      plot.margin = margin(10, 10, 10, 10),
+      axis.text = element_text(size = 16),
+      axis.title = element_text(size = 16),
+      plot.title = element_text(size = 16),
+      legend.text = element_text(size = 16),
+      legend.title = element_text(size = 16),
+      axis.ticks = element_line(size = 0.5, color = "black"),
+      axis.line = element_line(size = 0.5, color = "black"),
+      panel.background = element_blank(), 
+      panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank(),
+      panel.border = element_blank(),
+      axis.ticks.length = unit(0.3, "cm"),
+      panel.spacing = unit(2, "lines")
+   )
+
+ggsave ("figures/love_plot_pm.png", plot = plmp, width = 12, height = 10, dpi = 300)
+
+# Compute mean SMD
+smdmp_df <- balmp$Balance
+mean_smdmp_before <- mean(abs(smdmp_df$Diff.Un), na.rm = TRUE) 
+mean_smdmp_after <- mean(abs(smdmp_df$Diff.Adj), na.rm = TRUE) 
+mean_smdmp <- data.frame(
+  Mean_SMDmp_Before = mean_smdmp_before,
+  Mean_SMDmp_After = mean_smdmp_after
+)
+
+mean_smdmp
+
+
+# how much effective sample size remains (overall ESS: calculated manually)?
+summary(m.outp$weights)
+bal.tab(m.outp)$Effective.Sample.Size
+sum(m.outp$weights)^2 / sum(m.outp$weights^2)
+
+
+
+# propensity score distribution
+summary(m.outp$distance)
+hist(m.outp$distance)
+
+ggplot(
+  data.frame(
+    ps = m.outp$distance,
+    Treatment  = factor(Outp$Treatment)
+  ),
+  aes(ps, fill = Treatment)
+) +
+  geom_histogram(alpha = 0.5, bins = 30, position = "identity",   color = "black", linewidth = 0.3 ) +
+    scale_fill_viridis_d(
+    option = "mako",
+    begin = 0.3,
+    end = 0.8,
+    labels = c("Cohen", "Lich–Gregoir")
+  ) +
+  labs(
+    x = "Propensity score",
+    y = "Count",
+    fill = "Treatment"
+  ) +
+  theme_bw()
+
+ggsave("figures/propensity_psm_p.png",
+       width = 12,
+       height = 10,
+       dpi = 300)
+
+
+# Distributional balance for propensity score 
+
+# Before-After weighting
+p_psm_pain <- bal.plot(
+  m.outp,
+  var.name = "distance",
+  type = "density",
+  which = "both"
+) 
+
+p_psm_pain <- p_psm_pain +
+  scale_color_viridis_d(
+    option = "mako",
+    begin = 0.3,
+    end = 0.8,
+    labels = c("Cohen group", "Lich–Gregoir group")
+  ) +
+  scale_fill_viridis_d(
+    option = "mako",
+    begin = 0.3,
+    end = 0.8,
+    labels = c("Cohen group", "Lich–Gregoir group")
+  )
+
+ggsave(
+  "figures/PS_density_before_after_pm.png",
+  p_psm_pain,
+  width = 10,
+  height = 7,
+  dpi = 300
+)
+
+```
+ 
+#### 5.2 Descriptive analysis
+
+```{r painw}
+
+# mdatap is the dataset with added weightsp_psm
+
+# Convert variables to appropriate data types for analysis
+mdatap <- mdatap %>%
+  mutate(
+    across(c(PID, QCODE), as.character),
+    
+    across(c(AGS, YEARS,BLDLOSS, BMI, CATHPERIOD, FUPM, HOSPTIME,OPRTIME,
+             POSTUTIFUP, POSTUTI_T), as.numeric),
+    
+    across(c(ANASTOMO,BLDCOMPLEAK,BLDCOMPRETN,
+             BLDCOMPVOID,BLDSPASM,CATH,CENTER,CLAVIENCLASS,EPIDURAL,GENDER,
+             GU30, GU90N, GUER30, GUER90, HEMAT, 
+             HISTOINJ,ILEUS, INCCOMPBLEED, INCCOMPINF, INCCOMPSCAR, NARC, 
+             NONARC, PAIN, PREOPEPISODE1, PREOPRNPLN, PREOPRNSCR, PREOPTYPEU1,
+             PREOPVURGRADE, PROC365, STENT, SURGIND, SURGTECH2, TRT2, UDR7M,
+             URCOMPCVUR, URCOMPINJ, URCOMPOBST, URCOMPSTEN, POSTUTI, VURPHASE,
+             VURSIDE, RECGRADE_MAX, SURGIND2, LUTD, OBST, SURG, GU90,
+             CATHPERIOD_G, ANY, MINOR, MAJOR), as.factor)
+  )
+
+str(mdatap)
+
+
+# Matched baseline characteristics
+table1mp<- mdatap %>%
+  select(YEARS, AGS, GENDER, BMI, HISTOINJ, SURGIND2, PREOPVURGRADE, VURSIDE, UDR7M, VURPHASE, PREOPTYPEU1, PREOPEPISODE1, PREOPRNPLN, PREOPRNSCR,
+         SURGTECH2, CENTER, TRT2
+  ) %>%
+  tbl_summary(
+    by = TRT2,  # for stratification
+    statistic = list(
+      all_continuous() ~ "{median} ({p25}-{p75})",
+      all_categorical() ~ "{n} ({p}%)" 
+    ),
+    digits = all_categorical() ~ c(0, 1),  # n = 0 decimals, p = 1 decimal
+    missing = "ifany",  # shows missing only when present
+    missing_text = "Missing"
+  ) %>%
+  add_overall() %>%
+  add_p(pvalue_fun = ~style_pvalue(.x, digits = 3)) %>%  
+  bold_labels()
+
+table1mp <- table1mp %>%
+  modify_caption(
+    "Baseline characteristics after 1:1 propensity score matching among children who did not receive epidural analgesia"
+  )
+
+table1mp %>%
+  as_flex_table() %>%
+  flextable::save_as_docx(path = "output/baseline_m_pain.docx")
+
+
+# Matched procedural factors
+table2mp<- mdatap %>%
+  select(TRT2, OPRTIME, STENT, CATH, CATHPERIOD, CATHPERIOD_G, HOSPTIME) %>%
+  tbl_summary(
+    by = TRT2,  # for stratification
+    statistic = list(
+      all_continuous() ~ "{median} ({p25}-{p75})", # or ~ "{mean} ± {sd}",
+      all_categorical() ~ "{n} ({p}%)" 
+    ),
+    digits = all_categorical() ~ c(0, 1),  # n = 0 decimals, p = 1 decimal
+    missing = "ifany",
+    missing_text = "Missing"
+  ) %>%
+  add_overall() %>%
+  add_p(pvalue_fun = ~style_pvalue(.x, digits = 3)) %>%  #  3 decimals 
+  bold_labels()
+
+table2mp
+
+table2mp %>%
+  as_flex_table() %>%
+  flextable::save_as_docx(path = "output/procedural_m_pain.docx")
+
+
+# Matched pain
+
+# Before matching
+
+table4 <- Outp %>%
+  dplyr::select(PAIN, NARC, NONARC, Treatment) %>%
+  tbl_summary(
+    by = Treatment,
+    statistic = list(
+      all_categorical() ~ "{n} ({p}%)"
+    ),
+    label = list(
+      PAIN ~ "Pain score",
+      NARC ~ "Narcotic use",
+      NONARC ~ "Non-narcotic use"
+    ),
+    digits = all_categorical() ~ c(0, 1),
+    missing = "ifany",
+    missing_text = "Missing"
+  ) %>%
+  add_overall() %>%
+  add_p(pvalue_fun = ~style_pvalue(.x, digits = 3)) %>%
+  bold_labels()
+
+
+# After matching 
+
+
+# Matched pain characteristics
+
+table4m<- mdatap %>%
+  select(PAIN, NARC, NONARC, TRT2
+  ) %>%
+  tbl_summary(
+    by = TRT2,  # for stratification
+    statistic = list(
+      all_continuous() ~ "{median} ({p25}-{p75})",
+      all_categorical() ~ "{n} ({p}%)" 
+    ),
+    label = list(
+      PAIN ~ "Pain score",
+      NARC ~ "Narcotic use",
+      NONARC ~ "Non-narcotic use"
+    ),
+    digits = all_categorical() ~ c(0, 1),  # n = 0 decimals, p = 1 decimal
+    missing = "ifany",  # shows missing only when present
+    missing_text = "Missing"
+  ) %>%
+  add_overall() %>%
+  add_p(pvalue_fun = ~style_pvalue(.x, digits = 3)) %>% 
+  bold_labels()
+
+table4m <- table4m %>%
+  modify_caption(
+    "Pain characteristics after 1:1 propensity score matching among children who did not receive epidural analgesia"
+  )
+
+
+# MERGE TABLES
+table_combined_m <- tbl_merge(
+  tbls = list(table4, table4m),
+  tab_spanner = c("**Before matching**", "**After matching**")
+) %>%
+  modify_caption(
+    "Table 4. Comparison of pain intensity and analgesic use between treatment groups before and after propensity score 1:1 matching."
+) %>%
+  modify_source_note(
+    "Analysis restricted to patients not receiving epidural analgesia."
+  )
+
+table_combined_m
+
+table_combined_m %>%
+  as_flex_table() %>%
+  flextable::save_as_docx(path = "output/pain_m.docx")
+
+```
+
+#### 5.3 Plot:  BEFORE-AFTER matching
+
+```{r painplotm}
+
+# ============================================================
+# Pain distribution before and after 1:1 propensity-score matching
+# Non-epidural subgroup
+# ============================================================
+
+# -----------------------------
+# 1. Prepare datasets
+# -----------------------------
+
+# Before matching: all children without epidural analgesia
+before <- Outp %>%
+  mutate(
+    plot_weight = 1,
+    Status = "Before matching (N=383), p<0.001"
+  )
+
+# After matching: matched non-epidural population
+after <- mdatap %>%
+  mutate(
+    plot_weight = weightsp_psm,
+    Status = "After matching (N=180), p<0.001"
+  )
+
+# -----------------------------
+# 2. Combine datasets
+# -----------------------------
+
+plot_data <- bind_rows(before, after)
+
+# -----------------------------
+# 3. Pain labels
+# -----------------------------
+
+
+plot_data <- plot_data %>%
+  mutate(
+    PAIN_plot = factor(
+      PAIN,
+      levels = levels(PAIN),
+      labels = c(
+        "No pain", 
+        "Mild pain", 
+        "Moderate pain", 
+        "Severe pain"
+        )
+      )
+    )
+
+# -----------------------------
+# 4. Define order of panels
+# -----------------------------
+
+plot_data <- plot_data %>%
+  mutate(
+    Status = factor(
+      Status,
+      levels = c(
+        "Before matching (N=383), p<0.001",
+        "After matching (N=180), p<0.001"
+      )
+    )
+  )
+
+
+# ============================================================
+# Figure : 100% stacked bar plot
+# ============================================================
+
+plot_summary1 <- plot_data %>%
+  group_by(Status, Treatment, PAIN_plot) %>%
+  summarise(
+    weighted_n = sum(plot_weight, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  group_by(Status, Treatment) %>%
+  mutate(
+    Percent = 100 * weighted_n / sum(weighted_n)
+  )
+
+
+s1 <- ggplot(
+  plot_summary1,
+  aes(
+    x = Treatment,
+    y = Percent,
+    fill = PAIN_plot
+  )
+) +
+  geom_bar(
+    stat = "identity",
+    position = "fill",
+    width = 0.7
+  ) +
+  facet_wrap(~Status) +
+  labs(
+    x = "Treatment groups",
+    y = "Percentage of patients not receiving epidural analgesia (%)",
+    fill = "1-Day postoperative pain score"
+  ) +
+  scale_fill_manual(
+    values = c(
+      "No pain" = "#f5f5f5",
+      "Mild pain" = "#fee8c8",
+      "Moderate pain" = "#fdbb84",
+      "Severe pain" = "#e34a33"
+    )
+  ) +
+  scale_y_continuous(
+    labels = scales::percent_format(scale = 100)
+  ) +
+  theme_minimal() +
+  theme(
+    panel.grid = element_blank(),
+    axis.title = element_text(size = 12),
+    axis.text = element_text(size = 11),
+    panel.border = element_rect(
+      color = "black",
+      fill = NA
+    ),
+    strip.text = element_text(
+      face = "bold"
+    ),
+    panel.spacing = unit(
+      0,
+      "lines"
+    )
+  )
+
+
+ggsave(
+  filename = "figures/pain_stacked_m.png",
+  plot = s1,
+  width = 9,
+  height = 6,
+  dpi = 300
+)
+```
+
+
+#### 5.4 Regression
+
+```{r regpain}
+
+# -----------------------------------------
+### Moderate-severe pain vs. Other levels
+# -----------------------------------------
+
+mdatap <- mdatap %>%
+  mutate(
+    PAIN_ms = factor(
+      ifelse(
+        PAIN %in% c(
+          "Moderate pain (score 4-6)",
+          "Severe pain (score 7-10)"
+        ),
+        1,
+        0
+      ),
+      levels = c(0, 1),
+      labels = c(
+        "No/Mild pain (score 0-3)",
+        "Moderate-Severe pain (score 4-10)"
+      )
+    )
+  )
+
+
+mdatap$PAIN_ms <- ifelse(
+  mdatap$PAIN_ms == "Moderate-Severe pain (score 4-10)",
+  1,
+  0
+)
+
+# -----------------------------------------------------
+### Exploratory analysis: Severe pain vs. Other levels
+# -----------------------------------------------------
+
+mdatap <- mdatap %>%
+  mutate(
+    PAIN_s = factor(
+      ifelse(
+        PAIN == "Severe pain (score 7-10)",
+        1,
+        0
+      ),
+      levels = c(0, 1),
+      labels = c(
+        "No severe pain (score 0-6)",
+        "Severe pain (score 7-10)"
+      )
+    )
+  )
+
+# a numeric binary outcome:
+mdatap$PAIN_s <- ifelse(
+  mdatap$PAIN_s == "Severe pain (score 7-10)",
+  1,
+  0
+)
+
+#----------
+# Block 1
+#----------
+
+outcomes <- c(
+  "PAIN_ms",
+  "PAIN_s"
+)
+
+# convert outcomes to numeric
+mdatap[outcomes] <- lapply(
+  mdatap[outcomes],
+  function(x) as.numeric(as.character(x))
+)
+
+# Apply GEE model after matching for all binary outcomes
+gee_results_psmp <- lapply(outcomes, function(y) {
+  formula <- as.formula(
+    paste(y, "~ TRT2")
+  )
+  model <- geeglm(
+    formula,
+    data = mdatap,
+    id = CENTER,
+    weights = weightsp_psm,
+    family = binomial(link = "logit"),
+    corstr = "exchangeable"
+  )
+  tidy(model, exponentiate = TRUE, conf.int = TRUE)   # estimate = OR because exponentiate = TRUE
+})
+names(gee_results_psmp) <- outcomes
+
+
+# Combine results into one table
+gee_table_psmp <- do.call(
+  rbind,
+  lapply(names(gee_results_psmp), function(x){
+    tmp <- gee_results_psmp[[x]]
+    tmp <- tmp %>%
+      filter(grepl("^TRT2", term)) %>%
+      mutate(outcome = x)
+    tmp
+  })
+)
+
+# Create final manuscript table
+gee_table_final_psmp <- gee_table_psmp %>%
+  mutate(
+    Effect_measure = "OR",
+    Estimate = sprintf("%.2f", estimate),
+    CI = paste0(
+      sprintf("%.2f", conf.low),
+      "–",
+      sprintf("%.2f", conf.high)
+    ),
+    P_value = ifelse(p.value < 0.001, "<0.001", sprintf("%.3f", p.value))
+  ) %>%
+  dplyr::select(
+    Outcome = outcome,
+    Effect_measure,
+    Estimate,
+    CI,
+    P_value
+  )
+
+gee_table_final_psmp
+
+gee_table_final_psmp %>%
+  flextable() %>%
+  theme_booktabs() %>%
+  autofit() %>%
+  align(
+    j = c("Estimate", "CI", "P_value"),
+    align = "center",
+    part = "all"
+  ) %>%
+  save_as_docx(
+    path = "output/pain_unadj_m.docx"
+  )
+
+
+#--------
+# Block 2
+#---------
+
+outcomes <- c(
+  "PAIN_ms",
+  "PAIN_s"
+)
+
+
+# convert outcomes to numeric
+mdatap[outcomes] <- lapply(
+  mdatap[outcomes],
+  function(x) as.numeric(as.character(x))
+)
+
+# Predictors to include in the outcome models
+predictors <- c("TRT2", "STENT")
+
+
+# Apply GEE model after overlap weighting for all binary outcomes
+gee_results_psmp <- lapply(outcomes, function(y) {
+  formula <- as.formula(
+    paste(y, "~",
+          paste(predictors, collapse = " + ")
+   )
+  )  
+  model <- geeglm(
+    formula,
+    data = mdatap,
+    id = CENTER,
+    weights = weightsp_psm,
+    family = binomial(link = "logit"),
+    corstr = "exchangeable"
+  )
+  tidy(model, exponentiate = TRUE, conf.int = TRUE)   # estimate = OR because exponentiate = TRUE
+})
+names(gee_results_psmp) <- outcomes
+
+# Combine results into one table
+gee_table_psmp <- do.call(
+  rbind,
+  lapply(names(gee_results_psmp), function(x){
+    tmp <- gee_results_psmp[[x]]
+    tmp %>%
+      mutate(outcome = x)
+  })
+)
+
+# Create final manuscript table
+gee_table_final_psmp <- gee_table_psmp %>%
+  mutate(
+    Effect_measure = "OR",
+    Estimate = sprintf("%.2f", estimate),
+    CI = paste0(
+      sprintf("%.2f", conf.low),
+      "–",
+      sprintf("%.2f", conf.high)
+    ),
+    P_value = ifelse(p.value < 0.001, "<0.001", sprintf("%.3f", p.value))
+  ) %>%
+  dplyr::select(
+    Outcome = outcome,
+    Predictor = term,
+    Effect_measure,
+    Estimate,
+    CI,
+    P_value
+  )
+
+gee_table_final_psmp
+
+gee_table_final_psmp %>%
+  flextable() %>%
+  theme_booktabs() %>%
+  autofit() %>%
+  align(
+    j = c("Estimate", "CI", "P_value"),
+    align = "center",
+    part = "all"
+  ) %>%
+  save_as_docx(
+    path = "output/pain_adj_m.docx"
+  )
+
+
+#------------------------
+# Block 2ai- Interaction
+#------------------------
+
+outcomes <- c(
+  "PAIN_ms",
+  "PAIN_s"
+)
+
+
+# convert outcomes to numeric
+mdatap[outcomes] <- lapply(
+  mdatap[outcomes],
+  function(x) as.numeric(as.character(x))
+)
+
+# Function to extract treatment effects within each stent stratum
+get_gee_interaction_results <- function(y) {
+  
+  formula <- as.formula(
+    paste(y, "~ TRT2 * STENT")
+  )
+  
+  model <- geeglm(
+    formula,
+    data = mdatap,
+    id = CENTER,
+    weights = weightsp_psm,
+    family = binomial(link = "logit"),
+    corstr = "exchangeable"
+  )
+  
+  # Coefficients
+  beta <- coef(model)
+  
+  # Robust covariance matrix
+  V <- vcov(model)
+  
+  # -------------------------------------------------------
+  # LG vs Cohen among NO-STENT patients
+  # -------------------------------------------------------
+  
+  b_no_stent <- beta["TRT21"]
+  
+  se_no_stent <- sqrt(
+    V["TRT21", "TRT21"]
+  )
+  
+  OR_no_stent <- exp(b_no_stent)
+  
+  CI_no_stent <- exp(
+    b_no_stent + c(-1, 1) * 1.96 * se_no_stent
+  )
+  
+  # -------------------------------------------------------
+  # LG vs Cohen among STENTED patients
+  # = TRT21 + TRT21:STENT1
+  # -------------------------------------------------------
+  
+  b_stent <- beta["TRT21"] +
+    beta["TRT21:STENT1"]
+  
+  # Variance of the linear combination:
+  # Var(beta1 + beta3)
+  
+  var_stent <-
+    V["TRT21", "TRT21"] +
+    V["TRT21:STENT1", "TRT21:STENT1"] +
+    2 * V["TRT21", "TRT21:STENT1"]
+  
+  se_stent <- sqrt(var_stent)
+  
+  OR_stent <- exp(b_stent)
+  
+  CI_stent <- exp(
+    b_stent + c(-1, 1) * 1.96 * se_stent
+  )
+  
+  # -------------------------------------------------------
+  # Interaction test
+  # -------------------------------------------------------
+  
+  b_interaction <- beta["TRT21:STENT1"]
+  
+  se_interaction <- sqrt(
+    V["TRT21:STENT1", "TRT21:STENT1"]
+  )
+  
+  z_interaction <- b_interaction / se_interaction
+  
+  p_interaction <- 2 * pnorm(
+    abs(z_interaction),
+    lower.tail = FALSE
+  )
+  
+  # -------------------------------------------------------
+  # Return manuscript-ready results
+  # -------------------------------------------------------
+  
+  data.frame(
+    Outcome = y,
+    
+    `LG vs Cohen, No Stent` =
+      sprintf(
+        "%.2f (%.2f–%.2f)",
+        OR_no_stent,
+        CI_no_stent[1],
+        CI_no_stent[2]
+      ),
+    
+    `LG vs Cohen, Stent` =
+      sprintf(
+        "%.2f (%.2f–%.2f)",
+        OR_stent,
+        CI_stent[1],
+        CI_stent[2]
+      ),
+    
+    P_interaction = p_interaction,
+    
+    stringsAsFactors = FALSE
+  )
+}
+
+
+# Run for all 2 outcomes
+interaction_results <- do.call(
+  rbind,
+  lapply(outcomes, get_gee_interaction_results)
+)
+
+
+interaction_results
+```
+
+#### 5.5 Rosenbaum's sensitivity analyses 
+
+```{r rosenbaum}
+
+# Rosenbaum's primal sensitivity analysis
+
+outcomes <- c(
+  "PAIN_ms",
+  "PAIN_s"
+)
+
+# Convert outcomes to numeric
+mdatap[outcomes] <- lapply(
+  mdatap[outcomes],
+  function(x) as.numeric(as.character(x))
+)
+
+
+# Function for Rosenbaum sensitivity analysis using rbounds
+rosenbaum_binary <- function(outcome, data, match_object, 
+                             gamma_seq = seq(1, 11, by = 0.1),
+                            alpha = 0.05) {  
+  
+  # matched pairs
+  treated_ids <- rownames(match_object$match.matrix)
+  control_ids <- match_object$match.matrix[, 1]
+  
+  pairs <- data.frame(
+    treated = data[treated_ids, outcome],
+    control = data[control_ids, outcome]
+  )
+  
+  # remove missing outcome pairs
+  pairs <- na.omit(pairs)
+  
+  # discordant pairs
+  # x = control has outcome, treated does not
+  # y = treated has outcome, control does not
+  x <- sum(pairs$control == 1 & pairs$treated == 0)
+  y <- sum(pairs$treated == 1 & pairs$control == 0)
+  
+  # run Rosenbaum sensitivity
+  if ((x + y) == 0) {
+    return(data.frame(
+      Outcome = outcome,
+      Discordant_pairs = 0,
+      x = x,
+      y = y,
+      p_Gamma1 = NA,
+      gamma_max = NA,
+      p_gamma_max = NA
+    ))
+  }
+  
+  # Run sensitivity over Gamma values
+
+  gamma_results <- sapply(gamma_seq, function(g) {
+    
+  res <- binarysens(
+      x = x,
+      y = y,
+      Gamma = g,
+      GammaInc = 0.1  # GammaInc defines the increment used to increase Γ values when the function evaluates sensitivity.
+    )
+
+    # extract upper bound p-value corresponding to Gamma g
+    res$bounds$`Upper bound`[
+      res$bounds$Gamma == g
+    ]
+  })
+  
+    # p-value at Gamma = 1
+    p_gamma1 <- gamma_results[gamma_seq == 1]
+  
+    # first Gamma where upper p-value >= alpha
+    idx <- which(gamma_results < alpha)
+
+if(length(idx) == 0){
+
+  if(p_gamma1 >= alpha){
+    
+    gamma_max <- "NS at Gamma=1"
+    p_gamma_max <- NA
+    
+  } else {
+    
+    gamma_max <- paste0(">=", max(gamma_seq))
+    p_gamma_max <- gamma_results[length(gamma_results)]
+    
+  }
+
+} else {
+  
+  gamma_max_value <- gamma_seq[max(idx)]
+  
+  # If still significant at the maximum tested Gamma
+  if(gamma_max_value == max(gamma_seq)){
+    
+    gamma_max <- paste0(">=", max(gamma_seq))
+    
+  } else {
+    
+    gamma_max <- gamma_max_value
+    
+  }
+  
+  p_gamma_max <- gamma_results[max(idx)]
+}
+
+  # Extract p-values from rbounds object
+  data.frame(
+    Outcome = outcome,
+    Discordant_pairs = x + y,
+    x = x,
+    y = y,
+    p_Gamma1 = round(p_gamma1, 3),
+    gamma_max = gamma_max,
+    p_gamma_max = round(p_gamma_max, 3)
+  )
+}
+
+
+# Run all outcomes
+rosenbaum_results <- do.call(
+  rbind,
+  lapply(
+    outcomes,
+    rosenbaum_binary,
+    data = mdatap,
+    match_object = m.outp
+  )
+)
+
+rosenbaum_results
+
+
+# Rename columns for publication
+rosenbaum_results_pub <- rosenbaum_results %>%
+  rename(
+    Outcome = Outcome,
+    `Discordant pairs` = Discordant_pairs,
+    `Control only events (x)` = x,
+    `Treated only events (y)` = y,
+    `P-value (Γ=1)` = p_Gamma1,
+    `Γmax` = gamma_max,
+    `P-value at Γmax` = p_gamma_max
+  )
+
+
+# Create publication table
+rosenbaum_tablep <- rosenbaum_results_pub %>%
+  flextable() %>%
+  
+  # Add title
+  add_header_lines(
+    "Rosenbaum’s primal sensitivity analysis for pain in the matched cohort."
+  ) %>%
+  
+  # Add footnote
+  add_footer_lines(
+    "The Gamma value Γ is a measure of sensitivity to hidden bias, representing the magnitude of differential odds of treatment assignment due to an unmeasured confounder that could alter the study conclusion. Γmax refers to the highest value of Γ for which the upper-bound p-value remained below 0.05. P-values correspond to the upper bound."
+  ) %>%
+  
+  theme_booktabs() %>%
+  autofit() %>%
+  
+  align(
+    j = c(
+      "Discordant pairs",
+      "Control only events (x)",
+      "Treated only events (y)",
+      "P-value (Γ=1)",
+      "Γmax",
+      "P-value at Γmax"
+    ),
+    align = "center",
+    part = "all"
+  )
+
+
+# Save as Word document
+save_as_docx(
+  rosenbaum_tablep,
+  path = "output/Rosenbaum_effect_pain.docx"
+)
+
+```
+
+# TEMPORAL CHANGES
+
+### Number of procedures per year
+
+#### Plots
+
+```{r trtplot}
+
+#---------------------------------------
+# Horizontal bar for each year
+#---------------------------------------
+
+# -----------------
+# The whole cohort
+# -----------------
+
+plot_data1 <- Out %>%
+  count(YEARS, Treatment) %>%
+  group_by(Treatment) %>%
+  mutate(
+    Percent = 100 * n / sum(n)
+  ) %>%
+  ungroup()
+
+p_y_m1 <- ggplot(
+  plot_data1,
+  aes(
+    x = Percent,
+    y = factor(YEARS),
+    fill = Treatment
+  )
+) +
+  geom_col(
+    position = position_dodge(width = 0.8),
+    width = 0.7,
+    colour = "black"
+  ) +
+  scale_x_continuous(
+    limits = c(0, 100),
+    breaks = seq(0, 100, 20),
+    expand = expansion(mult = c(0, 0.02))
+  ) +
+  scale_fill_viridis_d(option = "mako", begin = 0.3, end = 0.8
+  ) +
+  labs(x = "Proportion", y = "Year of Surgery", fill = "Treatment Group") +
+  theme_classic()
+
+p_y_m1
+
+
+# ---------------------
+# After ATO weighting
+# ---------------------
+
+plot_data_ato <- Out %>%
+  group_by(YEARS, Treatment) %>%
+  summarise(
+    weighted_n = sum(weights),
+    .groups = "drop"
+  ) %>%
+  group_by(Treatment) %>%
+  mutate(
+    Percent = 100 * weighted_n / sum(weighted_n)
+  ) %>%
+  ungroup()
+
+p_y_m_ato <- ggplot(
+  plot_data_ato,
+  aes(
+    x = Percent,
+    y = factor(YEARS),
+    fill = Treatment
+  )
+) +
+  geom_col(
+    position = position_dodge(width = 0.8),
+    width = 0.7,
+    colour = "black"
+  ) +
+  scale_x_continuous(
+    limits = c(0, 100),
+    breaks = seq(0, 100, 20),
+    expand = expansion(mult = c(0, 0.02))
+  ) +
+  scale_fill_viridis_d(
+    option = "mako",
+    begin = 0.3,
+    end = 0.8
+  ) +
+  labs(
+    x = "Proportion",
+    y = "Year of Surgery",
+    fill = "Group"
+  ) +
+  theme_classic()
+
+p_y_m_ato
+
+
+
+# -----------------
+# After matching
+# -----------------
+
+plot_data <- mdata %>%
+  count(YEARS, Treatment) %>%
+  group_by(Treatment) %>%
+  mutate(
+    Percent = 100 * n / sum(n)
+  ) %>%
+  ungroup()
+
+p_y_m <- ggplot(
+  plot_data,
+  aes(
+    x = Percent,
+    y = factor(YEARS),
+    fill = Treatment
+  )
+) +
+  geom_col(
+    position = position_dodge(width = 0.8),
+    width = 0.7,
+    colour = "black"
+  ) +
+  scale_x_continuous(
+    limits = c(0, 100),
+    breaks = seq(0, 100, 20),
+    expand = expansion(mult = c(0, 0.02))
+  ) +
+  scale_fill_viridis_d(option = "mako", begin = 0.3, end = 0.8
+  ) +
+  labs(x = "Proportion", y = "Year of Surgery", fill = "Group") +
+  theme_classic()
+
+p_y_m
+
+#------------------------------------------------------------
+# Add subtitle (we can keep or remove them from the final figure)
+#------------------------------------------------------------
+
+p_y_m1 <- p_y_m1 +
+  labs(subtitle = "Whole cohort")
+
+
+p_y_m_ato <- p_y_m_ato +
+  labs(subtitle = "Overlap weighting population")
+
+p_y_m <- p_y_m +
+  labs(subtitle = "Matched cohort")
+
+#------------------------------------------------------------
+# Combine plot 
+#------------------------------------------------------------
+
+treatment_plot <-
+  p_y_m1 /
+  p_y_m_ato /
+  p_y_m +
+  plot_layout(heights = c(2,2,2)) +
+  plot_annotation(
+    tag_levels = "A"
+  )
+
+#------------------------------------------------------------
+# Save the figure
+#------------------------------------------------------------
+
+ggsave(filename = "figures/treatment_across_years.png", 
+       plot = treatment_plot, 
+       width = 8,   # width in inches
+       height = 10,  # height in inches
+       dpi = 300)   # resolution
+
+```
+
+#### Table
+
+```{r trttable}
+
+# -----------------
+# The whole cohort
+# -----------------
+year_table <- Out %>%
+  count(YEARS, Treatment) %>%
+  group_by(YEARS) %>%
+  mutate(
+    Percent = 100 * n / sum(n),
+    n_percent = paste0(n, " (", round(Percent, 1), "%)")
+  ) %>%
+  select(YEARS, Treatment, n_percent) %>%
+  pivot_wider(
+    names_from = Treatment,
+    values_from = n_percent
+  ) %>%
+  left_join(
+    Out %>%
+      count(YEARS, name = "Total_n") %>%
+      mutate(
+        Total_percent = 100 * Total_n / nrow(Out),
+        Total = paste0(Total_n, " (", round(Total_percent, 1), "%)")
+      ) %>%
+      select(YEARS, Total),
+    by = "YEARS"
+  ) %>%
+  arrange(YEARS)
+
+year_table <- year_table %>%
+  rename(
+    `Year of Surgery` = YEARS,
+    `Cohen n (%)` = Cohen,
+    `Lich–Gregoir n (%)` = `Lich–Gregoir`,
+    `Total surgeries` = Total
+  )
+
+year_table %>%
+  gt()
+
+year_table
+
+
+year_table <- year_table %>%
+  mutate(
+    `Year of Surgery` = as.character(`Year of Surgery`)
+  )
+
+year_table %>%
+  flextable() %>%
+  theme_booktabs() %>%
+  autofit() %>%
+  align(
+    align = "center",
+    part = "all"
+  ) %>%
+save_as_docx(
+  path = "output/treatment_year_whole_cohort.docx"
+)
+
+
+
+# -----------------
+# After matching
+# -----------------
+
+year_tablem <- mdata %>%
+  count(YEARS, Treatment) %>%
+  group_by(YEARS) %>%
+  mutate(
+    Percent = 100 * n / sum(n),
+    n_percent = paste0(n, " (", round(Percent, 1), "%)")
+  ) %>%
+  select(YEARS, Treatment, n_percent) %>%
+  pivot_wider(
+    names_from = Treatment,
+    values_from = n_percent
+  ) %>%
+  left_join(
+    Out %>%
+      count(YEARS, name = "Total_n") %>%
+      mutate(
+        Total_percent = 100 * Total_n / nrow(Out),
+        Total = paste0(Total_n, " (", round(Total_percent, 1), "%)")
+      ) %>%
+      select(YEARS, Total),
+    by = "YEARS"
+  ) %>%
+  arrange(YEARS)
+
+year_tablem <- year_tablem %>%
+  rename(
+    `Year of Surgery` = YEARS,
+    `Cohen n (%)` = Cohen,
+    `Lich–Gregoir n (%)` = `Lich–Gregoir`,
+    `Total surgeries` = Total
+  )
+
+year_tablem %>%
+  gt()
+
+year_tablem
+
+
+year_tablem <- year_tablem %>%
+  mutate(
+    `Year of Surgery` = as.character(`Year of Surgery`)
+  )
+
+year_tablem %>%
+  flextable() %>%
+  theme_booktabs() %>%
+  autofit() %>%
+  align(
+    align = "center",
+    part = "all"
+  ) %>%
+save_as_docx(
+  path = "output/treatment_year_matched_cohort.docx"
+)
+
+
+# ---------------------
+# After ATO weighting
+# ---------------------
+
+year_table_ato <- Out %>%
+  group_by(YEARS, Treatment) %>%
+  summarise(
+    weighted_n = sum(weights),
+    .groups = "drop"
+  ) %>%
+  group_by(YEARS) %>%
+  mutate(
+    Percent = 100 * weighted_n / sum(weighted_n),
+    n_percent = paste0(
+      round(weighted_n, 1),
+      " (",
+      round(Percent, 1),
+      "%)"
+    )
+  ) %>%
+  select(YEARS, Treatment, n_percent) %>%
+  pivot_wider(
+    names_from = Treatment,
+    values_from = n_percent
+  ) %>%
+  left_join(
+    Out %>%
+      group_by(YEARS) %>%
+      summarise(
+        weighted_total = sum(weights),
+        .groups = "drop"
+      ) %>%
+      mutate(
+        Total_percent = 100 * weighted_total / sum(weighted_total),
+        Total = paste0(
+          round(weighted_total, 1),
+          " (",
+          round(Total_percent, 1),
+          "%)"
+        )
+      ),
+    by = "YEARS"
+  ) %>%
+  arrange(YEARS)
+
+year_table_ato <- year_table_ato %>%
+  rename(
+    `Year of Surgery` = YEARS,
+    `Cohen n (%)` = Cohen,
+    `Lich–Gregoir n (%)` = `Lich–Gregoir`,
+    `Total surgeries` = Total
+  )
+
+year_table_ato %>%
+  gt()
+
+year_table_ato
+
+
+year_table_ato <- year_table_ato %>%
+  mutate(
+    `Year of Surgery` = as.character(`Year of Surgery`)
+  )
+
+year_table_ato %>%
+  flextable() %>%
+  theme_booktabs() %>%
+  autofit() %>%
+  align(
+    align = "center",
+    part = "all"
+  ) %>%
+save_as_docx(
+  path = "output/treatment_year_overlap_cohort.docx"
+)
+
+```
+
+
+#### Transition in practice: Observed transition in practice
+
+```{r transition}
+
+# -----------------
+# The whole cohort
+# -----------------
+
+plot_data1 <- Out %>%
+  count(YEARS, Treatment) %>%
+  group_by(YEARS) %>%
+  mutate(
+    Percent = 100 * n / sum(n)
+  ) %>%
+  ungroup()
+
+p_transition1 <- ggplot(
+  plot_data1,
+  aes(
+    x = YEARS,
+    y = Percent,
+    color = Treatment,
+    group = Treatment
+  )
+) +
+  geom_line(linewidth = 1.2) +
+  geom_point(size = 2) +
+  scale_y_continuous(
+    limits = c(0, 100),
+    breaks = seq(0, 100, 20),
+    labels = function(x) paste0(x, "%")
+  ) +
+  scale_x_continuous(
+    limits = c(2010, 2022),
+    breaks = seq(2010, 2022, 1),
+    expand = expansion(mult = c(0, 0.02))
+  ) +
+  scale_color_viridis_d(
+    option = "mako",
+    begin = 0.3,
+    end = 0.8
+  ) +
+  labs(
+    x = "Year of Surgery",
+    y = "Proportion of Procedures",
+    color = "Group"
+  ) +
+  theme_classic()
+
+p_transition1
+
+# -----------------
+# After matching
+# -----------------
+
+plot_data <- mdata %>%
+  count(YEARS, Treatment) %>%
+  group_by(YEARS) %>%
+  mutate(
+    Percent = 100 * n / sum(n)
+  ) %>%
+  ungroup()
+
+p_transition <- ggplot(
+  plot_data,
+  aes(
+    x = YEARS,
+    y = Percent,
+    color = Treatment,
+    group = Treatment
+  )
+) +
+  geom_line(linewidth = 1.2) +
+  geom_point(size = 2) +
+  scale_y_continuous(
+    limits = c(0, 100),
+    breaks = seq(0, 100, 20),
+    labels = function(x) paste0(x, "%")
+  ) +
+  scale_x_continuous(
+    limits = c(2010, 2022),
+    breaks = seq(2010, 2022, 1),
+    expand = expansion(mult = c(0, 0.02))
+  ) +
+  scale_color_viridis_d(
+    option = "mako",
+    begin = 0.3,
+    end = 0.8
+  ) +
+  labs(
+    x = "Year of Surgery",
+    y = "Proportion of Procedures",
+    color = "Group"
+  ) +
+  theme_classic()
+
+p_transition
+
+# ---------------------
+# After ATO weighting
+# ---------------------
+
+plot_data_ato <- Out %>%
+  group_by(YEARS, Treatment) %>%
+  summarise(
+    weighted_n = sum(weights),
+    .groups = "drop"
+  ) %>%
+  group_by(YEARS) %>%
+  mutate(
+    Percent = 100 * weighted_n / sum(weighted_n)
+  ) %>%
+  ungroup()
+
+p_transition_ato <- ggplot(
+  plot_data_ato,
+  aes(
+    x = YEARS,
+    y = Percent,
+    color = Treatment,
+    group = Treatment
+  )
+) +
+  geom_line(linewidth = 1.2) +
+  geom_point(size = 2) +
+  scale_y_continuous(
+    limits = c(0,100),
+    breaks = seq(0,100,20),
+    labels = function(x) paste0(x,"%")
+  ) +
+  scale_x_continuous(
+  limits = c(2010, 2022),
+  breaks = seq(2010, 2022, 1),
+  expand = expansion(mult = c(0, 0.02))
+  ) +
+  scale_color_viridis_d(
+    option = "mako",
+    begin = 0.3,
+    end = 0.8
+  ) +
+  labs(
+    x = "Year of Surgery",
+    y = "ATO-weighted proportion of procedures",
+    color = "Group"
+  ) +
+  theme_classic()
+
+p_transition_ato
+
+#------------------------------------------------------------
+# Add subtitle (we can keep or remove them from the final figure)
+#------------------------------------------------------------
+
+p_transition1 <- p_transition1 +
+  labs(subtitle = "Whole cohort")
+
+p_transition <- p_transition +
+  labs(subtitle = "Matched cohort")
+
+p_transition_ato <- p_transition_ato +
+  labs(subtitle = "Overlap weighting population")
+
+#------------------------------------------------------------
+# Combine plot 
+#------------------------------------------------------------
+
+transition_plot <-
+  p_transition1 /
+  p_transition /
+  p_transition_ato +
+  plot_layout(heights = c(2,2,2)) +
+  plot_annotation(
+    tag_levels = "A"
+  )
+
+#------------------------------------------------------------
+# Save the figure
+#------------------------------------------------------------
+ggsave(filename = "figures/transition_in practice.png", 
+       plot = transition_plot, 
+       width = 8,   # width in inches
+       height = 10,  # height in inches
+       dpi = 300)   # resolution
+
+```
+
+# FLOWCHART
+
+```{r flow}
+
+f <- grViz("
+digraph CONSORT {
+
+graph [
+    layout = dot,
+    rankdir = TB,
+    splines = ortho,
+    nodesep = 0.4,
+    ranksep = 0.6
+]
+
+node [
+  shape = box,
+  style = 'rounded,filled',
+  fillcolor = white
+]
+
+# Main pathway
+A [label =
+'Children undergoing unilateral ureteral reimplantation
+June 2010 – September 2022
+Assessed for eligibility
+N = 441']
+
+
+C [label = 'Original cohort\\nN = 412 (93.4%)
+
+Cohen group n= 197\\nLich-Gregoir group n= 215']
+
+D [label = 'Propensity score overlap weighting (ATO) using R software
+
+Propensity score model covariates: 
+Calendar year
+Indications for surgery
+Prior Deflux injection
+Age at surgery
+Gender
+BMI
+VUR grade and laterality
+Ureteral dilation
+VUR phase on VCUG
+Type and number of preoperative UTIs
+Preoperative acute pyelonephritis and renal scarring on DMSA
+Surgeon experience
+
+Covariate balance: Absolute standardized difference (ASD) <0.1']
+
+E [label = 'Weighted overlap pseudo-population\\nN = 412
+
+No exclusions after weighting, all patients contributed to analysis with weights']
+
+F [label = 'Weighted outcome analyses']
+
+# Side exclusion
+B [label = 'Excluded n = 29 (6.6%)
+
+Secondary VUR n = 0\\nRepeat or tapering reimplantation procedures n = 0\\nBladder and bowel dysfunction n = 0\\nPosterior urethral valves n = 0\\nPrevious bladder surgery n = 0\\nReflux-associated anomalies (ureterocoeles, duplex systems, megaureter, ectopic ureter) n = 28\\nSuspected renal failure related to multicystic dysplastic kidney n = 1']
+
+
+# Invisible branching point
+X [shape = point, width = 0.01, label = '']
+
+# Main flow
+A -> X [arrowhead = none]
+X -> C 
+C -> D
+D -> E
+E -> F
+
+# Side branch
+X -> B [style = dashed]
+
+# Keep exclusion box beside the main flow
+{ rank = same; X; B }
+
+}
+")
+
+
+svg <- export_svg(f)
+writeLines(svg, "figures/flowchart.svg")
+
+
+rsvg_png(
+  "figures/flowchart.svg",
+  "figures/flowchart.png",
+  width = 10000
+)
+
+
+
+saveWidget(
+  f,
+  file = "figures/flowchart.html",
+  selfcontained = TRUE
+)
+
+
+webshot(
+  "figures/flowchart.html",
+  file = "figures/flowchart.png",
+  vwidth = 800
+)
+
+
+# Convert html to png online: https://cloudconvert.com/to-png
+```
