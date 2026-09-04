@@ -1,7 +1,7 @@
 # Outcomes_Research
 Outcomes of Open Cohen vs. Lich-Gregoir Ureteral Reimplantation for Pediatric VUR
 
-This repository contains the dataset and code for the study, as well as the manuscript figures.
+This repository contains the study dataset, analysis code, and manuscript figures.
 
 ---
 ##  Purpose
