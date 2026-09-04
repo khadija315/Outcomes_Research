@@ -14,6 +14,8 @@
 .positai/
 
 # Research data - DO NOT upload
+output/
+figures/
 code_draft/
 
 # Temporary files
