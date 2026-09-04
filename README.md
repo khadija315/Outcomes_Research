@@ -1,20 +1,24 @@
 # Outcomes_Research
-Outcomes of Open Cohen vs. Lich-Gregoir Ureteral Reimplantation for Pediatric VUR
+## Outcomes of Open Cohen vs. Lich–Gregoir Ureteral Reimplantation for Pediatric VUR
 
 This repository contains the study dataset, analysis code, and manuscript figures.
 
 ---
 ##  Purpose
 
-This study compared postoperative outcomes in children for whom either technique was clinically appropriate and assessed whether ureteral stenting modified treatment effects.
+This study compared postoperative outcomes between open Cohen vs. Lich–Gregoir ureteral reimplantation in children with primary unilateral dilating vesicoureteral reflux (VUR) for whom either technique was clinically appropriate, and assessed whether ureteral stenting modified treatment effects.
 
 ---
 
 ## Study Population
 
 - **Design**: Multicenter retrospective cohort study 
-- **Participants**: 412 children with **primary unilateral dilating VUR (grades III–V)**
-- **Inclusion criteria**:
+- **Participants**: 412 children with primary unilateral dilating VUR (grades III–V)
+- **Study period:** June 2010–September 2022
+- **Initial cohort:** 441 children
+- **Final cohort:** 412 children after 29 exclusions
+  
+### Inclusion criteria
   - Underwent open ureteral reimplantation (Cohen or Lich-Gregoir) (June 2010– September 2022)
   - ≥1-year postoperative follow-up
   - Older than 1 year at surgery
