@@ -17,7 +17,7 @@ This study compared postoperative outcomes in children for whom either technique
 - **Inclusion criteria**:
   - Underwent open ureteral reimplantation (Cohen or Lich-Gregoir) (June 2010– September 2022)
   - ≥1-year postoperative follow-up
-  - > 1 year at surgery
+  - >1 year at surgery
 - **Exclusion criteria**:
   - Had secondary VUR
   - Had repeated or tapering reimplantation
